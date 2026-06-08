@@ -42,7 +42,7 @@ describe('createDownloader', () => {
         [
           '--no-playlist',
           '--format',
-          'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best',
+          'bv*[ext=mp4][vcodec^=avc1][height<=1280]+ba[ext=m4a]/b[ext=mp4][vcodec^=avc1][height<=1280]/bv*[ext=mp4][height<=1280]+ba[ext=m4a]/b[ext=mp4][height<=1280]/best[height<=1280]/best',
           '--merge-output-format',
           'mp4',
           '--max-filesize',
