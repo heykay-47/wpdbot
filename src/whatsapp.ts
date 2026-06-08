@@ -1,6 +1,6 @@
 import qrcode from 'qrcode-terminal';
 import whatsappWeb from 'whatsapp-web.js';
-import { canEnableGroup, canManageGroup, parseCommand } from './commands.js';
+import { canManageGroup, parseCommand } from './commands.js';
 import { handleIncomingMessage, type IncomingMessage, type RelayDownloader } from './relay.js';
 import type { AppConfig } from './config.js';
 import type { Store } from './store.js';
@@ -41,7 +41,14 @@ type WhatsappMessage = {
   fromMe?: boolean;
   reply(text: string): Promise<unknown> | unknown;
   getChat(): Promise<WhatsappChat>;
-  getContact?(): Promise<{ pushname?: string; name?: string; number?: string }>;
+  getContact?(): Promise<WhatsappContact>;
+};
+
+type WhatsappContact = {
+  id?: WhatsappId;
+  pushname?: string;
+  name?: string;
+  number?: string;
 };
 
 type WhatsappChat = {
@@ -52,10 +59,14 @@ type WhatsappChat = {
 };
 
 type WhatsappParticipant = {
-  id?: { _serialized?: string } | string;
+  id?: WhatsappId;
+  lid?: string;
+  phoneNumber?: WhatsappId;
   isAdmin?: boolean;
   isSuperAdmin?: boolean;
 };
+
+type WhatsappId = { _serialized?: string; user?: string; server?: string } | string;
 
 export function formatStatus({ enabled, maxFileSizeMb, duplicateWindowHours, botIsAdmin }: StatusInput): string {
   return [
@@ -92,7 +103,9 @@ export function createWhatsappBot({ config, store, downloader }: CreateWhatsappB
   client.on('qr', (qr) => qrcode.generate(qr, { small: true }));
   client.on('ready', () => console.log('WhatsApp client ready'));
   client.on('message', (message) => {
-    void handleWhatsappMessage(message as WhatsappMessage, client, config, store, relayWhatsapp, downloader);
+    return handleWhatsappMessage(message as WhatsappMessage, client, config, store, relayWhatsapp, downloader).catch((error: unknown) => {
+      console.error('Failed to handle WhatsApp message', error);
+    });
   });
 
   return {
@@ -120,21 +133,23 @@ async function handleWhatsappMessage(
   store.setGroupMetadata(groupId, chat.name ?? groupId, Date.now());
 
   const senderId = message.author ?? message.from;
+  const contact = await message.getContact?.();
   const botId = currentBotId(client);
-  const senderIsGroupAdmin = participantIsAdmin(chat.participants, senderId);
+  const senderIds = idCandidates(senderId, contact);
+  const senderIsGroupAdmin = participantIsAdmin(chat.participants, senderIds);
   const botIsAdmin = botId ? participantIsAdmin(chat.participants, botId) : false;
   const command = parseCommand(message.body ?? '');
 
   if (command) {
     const ownerId = store.getBotOwnerId() ?? config.ownerId;
-    const canManage = canManageGroup({ senderId, ownerId, senderIsGroupAdmin });
+    const canManage = canManageGroup({ senderId, ownerId, senderIsGroupAdmin }) || idsOverlap(senderIds, idCandidates(ownerId));
     if (!canManage) {
       await message.reply('Only group admins or bot owner can manage bot.');
       return;
     }
 
     if (command.action === 'enable') {
-      if (!canEnableGroup({ senderId, ownerId, senderIsGroupAdmin, botIsGroupAdmin: botIsAdmin })) {
+      if (!botIsAdmin) {
         await message.reply('Make bot a group admin before enabling.');
         return;
       }
@@ -156,7 +171,7 @@ async function handleWhatsappMessage(
   }
 
   await handleIncomingMessage({
-    message: await toIncomingMessage(message, chat, groupId),
+    message: await toIncomingMessage(message, chat, groupId, contact),
     store,
     whatsapp: {
       sendVideo: async (targetGroupId, filePath, caption) => {
@@ -172,8 +187,7 @@ async function handleWhatsappMessage(
   });
 }
 
-async function toIncomingMessage(message: WhatsappMessage, chat: WhatsappChat, groupId: string): Promise<IncomingMessage> {
-  const contact = await message.getContact?.();
+async function toIncomingMessage(message: WhatsappMessage, chat: WhatsappChat, groupId: string, contact?: WhatsappContact): Promise<IncomingMessage> {
   const senderId = message.author ?? message.from;
 
   return {
@@ -192,9 +206,9 @@ function chatId(chat: WhatsappChat): string | null {
   return serializedId(chat.id);
 }
 
-function participantIsAdmin(participants: WhatsappParticipant[] | undefined, id: string): boolean {
-  const normalizedId = normalizeId(id);
-  return Boolean(participants?.some((participant) => normalizeId(serializedId(participant.id) ?? '') === normalizedId && (participant.isAdmin || participant.isSuperAdmin)));
+function participantIsAdmin(participants: WhatsappParticipant[] | undefined, id: string | Set<string>): boolean {
+  const targetIds = typeof id === 'string' ? idCandidates(id) : id;
+  return Boolean(participants?.some((participant) => idsOverlap(participantIdCandidates(participant), targetIds) && (participant.isAdmin || participant.isSuperAdmin)));
 }
 
 function currentBotId(client: InstanceType<typeof Client>): string | null {
@@ -207,11 +221,55 @@ function messageId(message: unknown): string | null {
   return serializedId((message as { id?: { _serialized?: string } | string } | undefined)?.id);
 }
 
-function serializedId(value: { _serialized?: string } | string | undefined): string | null {
+function serializedId(value: WhatsappId | undefined): string | null {
   if (!value) return null;
-  return typeof value === 'string' ? value : value._serialized ?? null;
+  if (typeof value === 'string') return value;
+  if (value._serialized) return value._serialized;
+  return value.user && value.server ? `${value.user}@${value.server}` : null;
 }
 
-function normalizeId(value: string): string {
-  return value.includes('@') ? value : `${value}@c.us`;
+function idCandidates(value: WhatsappId | undefined, contact?: WhatsappContact): Set<string> {
+  const candidates = new Set<string>();
+  addIdCandidate(candidates, serializedId(value));
+
+  if (typeof value === 'object' && value) {
+    addUserServerCandidate(candidates, value.user, value.server);
+  }
+
+  addIdCandidate(candidates, serializedId(contact?.id));
+  addIdCandidate(candidates, contact?.number);
+
+  return candidates;
+}
+
+function participantIdCandidates(participant: WhatsappParticipant): Set<string> {
+  const candidates = idCandidates(participant.id);
+  addIdCandidate(candidates, serializedId(participant.phoneNumber));
+  addIdCandidate(candidates, participant.lid);
+  return candidates;
+}
+
+function idsOverlap(left: Set<string>, right: Set<string>): boolean {
+  for (const value of left) {
+    if (right.has(value)) return true;
+  }
+
+  return false;
+}
+
+function addUserServerCandidate(candidates: Set<string>, user: string | undefined, server: string | undefined): void {
+  if (user && server) addIdCandidate(candidates, `${user}@${server}`);
+}
+
+function addIdCandidate(candidates: Set<string>, value: string | null | undefined): void {
+  if (!value) return;
+
+  const trimmed = value.trim();
+  if (!trimmed) return;
+
+  candidates.add(trimmed);
+  if (!trimmed.includes('@')) {
+    candidates.add(`${trimmed}@c.us`);
+    candidates.add(`${trimmed}@lid`);
+  }
 }

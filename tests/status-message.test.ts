@@ -138,6 +138,66 @@ describe('createWhatsappBot', () => {
     );
   });
 
+  test('allows group admin when message author uses LID and participant has phone id', async () => {
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
+    const message = fakeMessage('!bot status', {
+      author: 'admin-lid@lid',
+      contact: { id: { _serialized: 'admin-phone@c.us' }, number: 'admin-phone', pushname: 'Admin' },
+      participants: [
+        { id: { _serialized: 'admin-phone@c.us', user: 'admin-phone', server: 'c.us' }, lid: 'admin-lid', isAdmin: true, isSuperAdmin: false },
+        { id: { _serialized: 'bot@c.us' }, isAdmin: true, isSuperAdmin: false },
+      ],
+    });
+
+    await clients[0].handlers.get('message')?.(message);
+
+    expect(message.reply).toHaveBeenCalledWith(
+      'Bot status: disabled\nMax size: 64 MB\nDuplicate window: 24 hours\nSupported: YouTube, Instagram, Facebook\nBot admin: yes',
+    );
+  });
+
+  test('allows owner when configured phone id matches sender alternate LID', async () => {
+    const store = fakeStore();
+    store.getBotOwnerId.mockReturnValue('admin-phone@c.us');
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: { ...baseConfig(), ownerId: 'admin-phone@c.us' }, store, downloader: fakeDownloader() });
+    const message = fakeMessage('!bot status', {
+      author: 'admin-lid@lid',
+      contact: { id: { _serialized: 'admin-phone@c.us' }, number: 'admin-phone', pushname: 'Admin' },
+      participants: [
+        { id: { _serialized: 'admin-phone@c.us', user: 'admin-phone', server: 'c.us' }, lid: 'admin-lid', isAdmin: false, isSuperAdmin: false },
+        { id: { _serialized: 'bot@c.us' }, isAdmin: true, isSuperAdmin: false },
+      ],
+    });
+
+    await clients[0].handlers.get('message')?.(message);
+
+    expect(message.reply).toHaveBeenCalledWith(
+      'Bot status: disabled\nMax size: 64 MB\nDuplicate window: 24 hours\nSupported: YouTube, Instagram, Facebook\nBot admin: yes',
+    );
+  });
+
+  test('allows owner using sender alternate LID to enable group when bot is admin', async () => {
+    const store = fakeStore();
+    store.getBotOwnerId.mockReturnValue('admin-phone@c.us');
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: { ...baseConfig(), ownerId: 'admin-phone@c.us' }, store, downloader: fakeDownloader() });
+    const message = fakeMessage('!bot enable', {
+      author: 'admin-lid@lid',
+      contact: { id: { _serialized: 'admin-phone@c.us' }, number: 'admin-phone', pushname: 'Admin' },
+      participants: [
+        { id: { _serialized: 'admin-phone@c.us', user: 'admin-phone', server: 'c.us' }, lid: 'admin-lid', isAdmin: false, isSuperAdmin: false },
+        { id: { _serialized: 'bot@c.us' }, isAdmin: true, isSuperAdmin: false },
+      ],
+    });
+
+    await clients[0].handlers.get('message')?.(message);
+
+    expect(store.setGroupEnabled).toHaveBeenCalledWith('group-1@g.us', true);
+    expect(message.reply).toHaveBeenCalledWith('Bot enabled.');
+  });
+
   test('ignores bot-authored commands', async () => {
     const store = fakeStore();
     const { createWhatsappBot } = await import('../src/whatsapp');
@@ -200,25 +260,35 @@ function fakeDownloader() {
   return { download: vi.fn(async () => ({ filePath: '/tmp/video.mp4', sizeBytes: 1 })) };
 }
 
-function fakeMessage(body: string, options: { botIsAdmin?: boolean; fromMe?: boolean } = {}) {
+function fakeMessage(
+  body: string,
+  options: {
+    botIsAdmin?: boolean;
+    fromMe?: boolean;
+    author?: string;
+    contact?: Record<string, unknown>;
+    participants?: Array<Record<string, unknown>>;
+  } = {},
+) {
   const botIsAdmin = options.botIsAdmin ?? true;
+  const participants = options.participants ?? [
+    { id: { _serialized: 'admin@c.us' }, isAdmin: true, isSuperAdmin: false },
+    { id: { _serialized: 'bot@c.us' }, isAdmin: botIsAdmin, isSuperAdmin: false },
+  ];
   return {
     id: { _serialized: 'message-1' },
     from: 'group-1@g.us',
-    author: 'admin@c.us',
+    author: options.author ?? 'admin@c.us',
     body,
     timestamp: 1,
     fromMe: options.fromMe ?? false,
     reply: vi.fn(),
-    getContact: vi.fn(async () => ({ pushname: 'Admin', name: 'Admin', number: 'admin' })),
+    getContact: vi.fn(async () => options.contact ?? { pushname: 'Admin', name: 'Admin', number: 'admin' }),
     getChat: vi.fn(async () => ({
       isGroup: true,
       id: { _serialized: 'group-1@g.us' },
       name: 'Group 1',
-      participants: [
-        { id: { _serialized: 'admin@c.us' }, isAdmin: true, isSuperAdmin: false },
-        { id: { _serialized: 'bot@c.us' }, isAdmin: botIsAdmin, isSuperAdmin: false },
-      ],
+      participants,
     })),
   };
 }
