@@ -93,10 +93,17 @@ Do not commit `.env`, WhatsApp auth/cache, database files, or downloads. The con
 - Create a private WhatsApp test group.
 - Add bot account and make it group admin.
 - Start the container and scan QR.
+- Restart the container; confirm session persists without a new QR scan.
 - Send `!bot status`; confirm bot admin shows `yes`.
 - Send `!bot enable`; confirm enabled response.
 - Send one YouTube link; confirm repost, caption, and original deletion.
-- Send one Instagram link; confirm repost or clear failure message.
-- Send one Facebook link; confirm repost or clear failure message.
+- Send one Instagram link; confirm repost, caption, and original deletion.
+- Send one Facebook link; confirm repost, caption, and original deletion.
 - Send the same link again within 24 hours; confirm duplicate skip.
 - Send `!bot disable`; confirm future links are ignored.
+
+## Final Verification
+
+- `npm test`: passed, 8 files, 70 tests.
+- `npm run build`: passed.
+- `docker compose build`: not run; `docker` command unavailable in WSL.
