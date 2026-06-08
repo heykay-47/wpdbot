@@ -126,4 +126,18 @@ describe('createStore', () => {
       updatedAtMs: 1_000,
     });
   });
+
+  it('returns null when bot owner id is missing', () => {
+    const store = createTempStore();
+
+    expect(store.getBotOwnerId()).toBeNull();
+  });
+
+  it('stores and returns bot owner id', () => {
+    const store = createTempStore();
+
+    store.setBotOwnerId('919999999999@c.us');
+
+    expect(store.getBotOwnerId()).toBe('919999999999@c.us');
+  });
 });

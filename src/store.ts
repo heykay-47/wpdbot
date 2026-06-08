@@ -33,6 +33,8 @@ export type Store = {
   wasRecentlyPosted(groupId: string, urlHash: string, nowMs: number, windowHours: number): boolean;
   setGroupMetadata(groupId: string, name: string, updatedAtMs: number): void;
   getGroupMetadata(groupId: string): GroupMetadata | null;
+  setBotOwnerId(ownerId: string): void;
+  getBotOwnerId(): string | null;
   recordRepost(record: RepostRecord): void;
   countReposts(): number;
   close(): void;
@@ -55,12 +57,17 @@ type GroupMetadataRow = {
   updated_at_ms: number;
 };
 
+type BotIdentityRow = {
+  value: string;
+};
+
 type CountRow = {
   count: number;
 };
 
 const defaultMaxFileSizeMb = 64;
 const defaultDuplicateWindowHours = 24;
+const botOwnerIdKey = 'owner_id';
 
 export function createStore(path: string, defaults: StoreDefaults = {}): Store {
   const db = new Database(path);
@@ -95,6 +102,11 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
       group_id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       updated_at_ms INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS bot_identity (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     );
   `);
 
@@ -135,6 +147,16 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
     SELECT group_id, name, updated_at_ms
     FROM group_metadata
     WHERE group_id = ?
+  `);
+  const upsertBotIdentity = db.prepare(`
+    INSERT INTO bot_identity (key, value)
+    VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `);
+  const selectBotIdentity = db.prepare<string, BotIdentityRow>(`
+    SELECT value
+    FROM bot_identity
+    WHERE key = ?
   `);
   const selectRepostCount = db.prepare<[], CountRow>(`
     SELECT COUNT(*) AS count
@@ -191,6 +213,14 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
         name: row.name,
         updatedAtMs: row.updated_at_ms,
       };
+    },
+
+    setBotOwnerId(ownerId) {
+      upsertBotIdentity.run(botOwnerIdKey, ownerId);
+    },
+
+    getBotOwnerId() {
+      return selectBotIdentity.get(botOwnerIdKey)?.value ?? null;
     },
 
     recordRepost(record) {
