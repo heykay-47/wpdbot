@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
 import { rm } from 'node:fs/promises';
-import { basename, dirname } from 'node:path';
 import { formatCaption } from './caption';
 import { extractFirstSupportedUrl, normalizeUrlForDuplicate } from './url';
 import type { Store } from './store';
@@ -32,18 +31,16 @@ export type HandleIncomingMessageInput = {
   whatsapp: RelayWhatsapp;
   downloader: RelayDownloader;
   timezone: string;
+  nowMs?: number;
+  cleanupPath?: (filePath: string) => Promise<void>;
 };
 
 function hashUrl(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
-async function cleanupDownloadedPath(filePath: string | null): Promise<void> {
-  if (!filePath) return;
-
-  const parent = dirname(filePath);
-  const target = basename(parent).startsWith('download-') ? parent : filePath;
-  await rm(target, { force: true, recursive: true }).catch(() => undefined);
+async function defaultCleanupPath(filePath: string): Promise<void> {
+  await rm(filePath, { force: true }).catch(() => undefined);
 }
 
 function errorMessage(error: unknown): string {
@@ -56,6 +53,8 @@ export async function handleIncomingMessage({
   whatsapp,
   downloader,
   timezone,
+  nowMs = Date.now(),
+  cleanupPath = defaultCleanupPath,
 }: HandleIncomingMessageInput): Promise<void> {
   if (!message.isGroup || message.fromMe) return;
 
@@ -67,37 +66,58 @@ export async function handleIncomingMessage({
 
   const normalizedUrl = normalizeUrlForDuplicate(supportedUrl.url);
   const urlHash = hashUrl(normalizedUrl);
-  if (store.wasRecentlyPosted(message.groupId, urlHash, message.timestampMs, settings.duplicateWindowHours)) return;
+  if (store.wasRecentlyPosted(message.groupId, urlHash, nowMs, settings.duplicateWindowHours)) return;
 
   let filePath: string | null = null;
 
   try {
-    const download = await downloader.download(supportedUrl.url, settings.maxFileSizeMb);
+    let download: { filePath: string; sizeBytes: number };
+    try {
+      download = await downloader.download(supportedUrl.url, settings.maxFileSizeMb);
+    } catch (error) {
+      await whatsapp.sendText(message.groupId, `Could not download this video: ${errorMessage(error)}`);
+      return;
+    }
+
     filePath = download.filePath;
 
-    await whatsapp.sendVideo(
-      message.groupId,
-      download.filePath,
-      formatCaption({
-        displayName: message.senderName,
-        timestampMs: message.timestampMs,
-        timezone,
-        originalUrl: supportedUrl.url,
-      }),
-    );
+    try {
+      await whatsapp.sendVideo(
+        message.groupId,
+        download.filePath,
+        formatCaption({
+          displayName: message.senderName,
+          timestampMs: message.timestampMs,
+          timezone,
+          originalUrl: supportedUrl.url,
+        }),
+      );
+    } catch (error) {
+      await whatsapp.sendText(message.groupId, `Could not upload this video: ${errorMessage(error)}`);
+      return;
+    }
 
-    await whatsapp.deleteMessage(message.id).catch(() => undefined);
-    store.recordDuplicate(message.groupId, urlHash, message.timestampMs);
-    store.recordRepost({
-      groupId: message.groupId,
-      senderId: message.senderId,
-      url: supportedUrl.url,
-      urlHash,
-      createdAtMs: message.timestampMs,
-    });
-  } catch (error) {
-    await whatsapp.sendText(message.groupId, `Could not download this video: ${errorMessage(error)}`);
+    try {
+      await whatsapp.deleteMessage(message.id);
+    } catch (error) {
+      await whatsapp.sendText(
+        message.groupId,
+        `Video posted, but I could not delete the original message: ${errorMessage(error)}`,
+      );
+    }
+
+    try {
+      store.recordSuccessfulRepost({
+        groupId: message.groupId,
+        senderId: message.senderId,
+        url: supportedUrl.url,
+        urlHash,
+        createdAtMs: nowMs,
+      });
+    } catch (error) {
+      await whatsapp.sendText(message.groupId, `Video posted, but I could not save repost history: ${errorMessage(error)}`);
+    }
   } finally {
-    await cleanupDownloadedPath(filePath);
+    if (filePath) await cleanupPath(filePath).catch(() => undefined);
   }
 }

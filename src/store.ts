@@ -36,6 +36,7 @@ export type Store = {
   setBotOwnerId(ownerId: string): void;
   getBotOwnerId(): string | null;
   recordRepost(record: RepostRecord): void;
+  recordSuccessfulRepost(record: RepostRecord): void;
   countReposts(): number;
   close(): void;
 };
@@ -162,6 +163,10 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
     SELECT COUNT(*) AS count
     FROM repost_history
   `);
+  const recordSuccessfulRepost = db.transaction((record: RepostRecord) => {
+    insertRepost.run(record.groupId, record.senderId, record.url, record.urlHash, record.createdAtMs);
+    upsertDuplicate.run(record.groupId, record.urlHash, record.createdAtMs);
+  });
 
   return {
     getGroupSettings(groupId) {
@@ -225,6 +230,10 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
 
     recordRepost(record) {
       insertRepost.run(record.groupId, record.senderId, record.url, record.urlHash, record.createdAtMs);
+    },
+
+    recordSuccessfulRepost(record) {
+      recordSuccessfulRepost(record);
     },
 
     countReposts() {

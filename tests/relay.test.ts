@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { handleIncomingMessage, type IncomingMessage, type RelayDownloader, type RelayWhatsapp } from '../src/relay';
 import type { Store } from '../src/store';
@@ -53,6 +53,9 @@ function createStore(overrides: Partial<Store> = {}): Store & { calls: StoreCall
     },
     recordRepost(record) {
       calls.push({ name: 'recordRepost', args: [record] });
+    },
+    recordSuccessfulRepost(record) {
+      calls.push({ name: 'recordSuccessfulRepost', args: [record] });
     },
     countReposts() {
       calls.push({ name: 'countReposts', args: [] });
@@ -114,13 +117,25 @@ afterEach(async () => {
 });
 
 describe('handleIncomingMessage', () => {
-  it('downloads first supported URL, sends video, deletes original, records history, and cleans temp directory', async () => {
+  it('downloads first supported URL, sends video, deletes original, records success with nowMs, and cleans through injected cleanup', async () => {
     const filePath = await createDownloadedFile();
     const store = createStore();
     const whatsapp = createWhatsapp();
     const downloader = createDownloader(filePath);
+    const cleanupCalls: string[] = [];
+    const nowMs = Date.UTC(2026, 5, 8, 15, 0);
 
-    await handleIncomingMessage({ message: baseMessage, store, whatsapp, downloader, timezone: 'Asia/Kolkata' });
+    await handleIncomingMessage({
+      message: baseMessage,
+      store,
+      whatsapp,
+      downloader,
+      timezone: 'Asia/Kolkata',
+      nowMs,
+      cleanupPath: async (path) => {
+        cleanupCalls.push(path);
+      },
+    });
 
     expect(downloader.calls).toEqual([
       { name: 'download', args: ['https://youtu.be/Video123?utm_source=x', 32] },
@@ -139,16 +154,31 @@ describe('handleIncomingMessage', () => {
     expect(store.calls.map((call) => call.name)).toEqual([
       'getGroupSettings',
       'wasRecentlyPosted',
-      'recordDuplicate',
-      'recordRepost',
+      'recordSuccessfulRepost',
     ]);
-    expect(store.calls.find((call) => call.name === 'recordRepost')?.args[0]).toMatchObject({
+    expect(store.calls.find((call) => call.name === 'wasRecentlyPosted')?.args[2]).toBe(nowMs);
+    expect(store.calls.find((call) => call.name === 'recordSuccessfulRepost')?.args[0]).toMatchObject({
       groupId: 'group-1@g.us',
       senderId: 'sender@c.us',
       url: 'https://youtu.be/Video123?utm_source=x',
-      createdAtMs: baseMessage.timestampMs,
+      createdAtMs: nowMs,
     });
-    expect(existsSync(dirname(filePath))).toBe(false);
+    expect(cleanupCalls).toEqual([filePath]);
+    expect(existsSync(filePath)).toBe(true);
+  });
+
+  it('uses processing time for duplicate cache checks instead of message timestamp', async () => {
+    const nowMs = baseMessage.timestampMs + 10 * 60 * 1000;
+    const store = createStore();
+    const whatsapp = createWhatsapp();
+    const downloader = createDownloader();
+
+    await handleIncomingMessage({ message: baseMessage, store, whatsapp, downloader, timezone: 'Asia/Kolkata', nowMs });
+
+    expect(store.calls.find((call) => call.name === 'wasRecentlyPosted')?.args[2]).toBe(nowMs);
+    expect(store.calls.find((call) => call.name === 'recordSuccessfulRepost')?.args[0]).toMatchObject({
+      createdAtMs: nowMs,
+    });
   });
 
   it('ignores non-group messages, bot messages, unsupported URLs, and disabled groups', async () => {
@@ -208,7 +238,7 @@ describe('handleIncomingMessage', () => {
     expect(store.calls.map((call) => call.name)).toEqual(['getGroupSettings', 'wasRecentlyPosted']);
   });
 
-  it('preserves original message, sends error text, and cleans temp directory when upload fails', async () => {
+  it('preserves original message, sends upload error text, and cleans file when upload fails', async () => {
     const filePath = await createDownloadedFile();
     const store = createStore();
     const whatsapp = createWhatsapp({
@@ -224,13 +254,13 @@ describe('handleIncomingMessage', () => {
     expect(whatsapp.calls.map((call) => call.name)).toEqual(['sendVideo', 'sendText']);
     expect(whatsapp.calls.at(-1)).toEqual({
       name: 'sendText',
-      args: ['group-1@g.us', 'Could not download this video: upload failed'],
+      args: ['group-1@g.us', 'Could not upload this video: upload failed'],
     });
     expect(store.calls.map((call) => call.name)).toEqual(['getGroupSettings', 'wasRecentlyPosted']);
-    expect(existsSync(dirname(filePath))).toBe(false);
+    expect(existsSync(filePath)).toBe(false);
   });
 
-  it('does not claim download failure when delete fails after successful send', async () => {
+  it('sends delete-specific text when delete fails after successful send', async () => {
     const filePath = await createDownloadedFile();
     const store = createStore();
     const whatsapp = createWhatsapp({
@@ -243,13 +273,37 @@ describe('handleIncomingMessage', () => {
 
     await handleIncomingMessage({ message: baseMessage, store, whatsapp, downloader, timezone: 'Asia/Kolkata' });
 
-    expect(whatsapp.calls.map((call) => call.name)).toEqual(['sendVideo', 'deleteMessage']);
+    expect(whatsapp.calls.map((call) => call.name)).toEqual(['sendVideo', 'deleteMessage', 'sendText']);
+    expect(whatsapp.calls.at(-1)).toEqual({
+      name: 'sendText',
+      args: ['group-1@g.us', 'Video posted, but I could not delete the original message: not admin'],
+    });
     expect(store.calls.map((call) => call.name)).toEqual([
       'getGroupSettings',
       'wasRecentlyPosted',
-      'recordDuplicate',
-      'recordRepost',
+      'recordSuccessfulRepost',
     ]);
-    expect(existsSync(dirname(filePath))).toBe(false);
+    expect(existsSync(filePath)).toBe(false);
+  });
+
+  it('sends history-specific text when store recording fails after successful send', async () => {
+    const filePath = await createDownloadedFile();
+    const store = createStore({
+      recordSuccessfulRepost(record) {
+        store.calls.push({ name: 'recordSuccessfulRepost', args: [record] });
+        throw new Error('database locked');
+      },
+    });
+    const whatsapp = createWhatsapp();
+    const downloader = createDownloader(filePath);
+
+    await handleIncomingMessage({ message: baseMessage, store, whatsapp, downloader, timezone: 'Asia/Kolkata' });
+
+    expect(whatsapp.calls.map((call) => call.name)).toEqual(['sendVideo', 'deleteMessage', 'sendText']);
+    expect(whatsapp.calls.at(-1)).toEqual({
+      name: 'sendText',
+      args: ['group-1@g.us', 'Video posted, but I could not save repost history: database locked'],
+    });
+    expect(existsSync(filePath)).toBe(false);
   });
 });

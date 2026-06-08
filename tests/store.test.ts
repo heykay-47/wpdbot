@@ -113,6 +113,21 @@ describe('createStore', () => {
     expect(store.countReposts()).toBe(2);
   });
 
+  it('records duplicate cache and repost history in one successful repost operation', () => {
+    const store = createTempStore();
+
+    store.recordSuccessfulRepost({
+      groupId: 'group-1@g.us',
+      senderId: 'sender@c.us',
+      url: 'https://youtu.be/example',
+      urlHash: 'hash-a',
+      createdAtMs: 5_000,
+    });
+
+    expect(store.countReposts()).toBe(1);
+    expect(store.wasRecentlyPosted('group-1@g.us', 'hash-a', 6_000, 1)).toBe(true);
+  });
+
   it('stores and returns group metadata', () => {
     const store = createTempStore();
 
