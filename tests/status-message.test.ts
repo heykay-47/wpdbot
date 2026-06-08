@@ -138,6 +138,19 @@ describe('createWhatsappBot', () => {
     );
   });
 
+  test('ignores bot-authored commands', async () => {
+    const store = fakeStore();
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: baseConfig(), store, downloader: fakeDownloader() });
+    const message = fakeMessage('!bot status', { fromMe: true });
+
+    await clients[0].handlers.get('message')?.(message);
+
+    expect(message.reply).not.toHaveBeenCalled();
+    expect(store.getGroupSettings).not.toHaveBeenCalled();
+    expect(store.setGroupEnabled).not.toHaveBeenCalled();
+  });
+
   test('relayWhatsapp sends video, text, and deletes messages for everyone', async () => {
     const { createWhatsappBot } = await import('../src/whatsapp');
     const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
@@ -187,7 +200,7 @@ function fakeDownloader() {
   return { download: vi.fn(async () => ({ filePath: '/tmp/video.mp4', sizeBytes: 1 })) };
 }
 
-function fakeMessage(body: string, options: { botIsAdmin?: boolean } = {}) {
+function fakeMessage(body: string, options: { botIsAdmin?: boolean; fromMe?: boolean } = {}) {
   const botIsAdmin = options.botIsAdmin ?? true;
   return {
     id: { _serialized: 'message-1' },
@@ -195,7 +208,7 @@ function fakeMessage(body: string, options: { botIsAdmin?: boolean } = {}) {
     author: 'admin@c.us',
     body,
     timestamp: 1,
-    fromMe: false,
+    fromMe: options.fromMe ?? false,
     reply: vi.fn(),
     getContact: vi.fn(async () => ({ pushname: 'Admin', name: 'Admin', number: 'admin' })),
     getChat: vi.fn(async () => ({

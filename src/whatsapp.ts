@@ -114,6 +114,7 @@ async function handleWhatsappMessage(
 ): Promise<void> {
   const chat = await message.getChat();
   if (!chat.isGroup) return;
+  if (message.fromMe) return;
 
   const groupId = chatId(chat) ?? message.from;
   store.setGroupMetadata(groupId, chat.name ?? groupId, Date.now());
