@@ -21,11 +21,11 @@ WhatsApp media relay bot for groups. It watches enabled WhatsApp groups for supp
 
    ```env
    BOT_OWNER_ID=919999999999@c.us
-   SQLITE_PATH=/app/data/bot.db
+   SQLITE_PATH=/data/bot.db
    TIMEZONE=Asia/Kolkata
    MAX_FILE_SIZE_MB=64
    DUPLICATE_WINDOW_HOURS=24
-   DOWNLOAD_DIR=/app/downloads
+   DOWNLOAD_DIR=/tmp/wpdbot-downloads
    ```
 
 3. Build image:
@@ -56,14 +56,14 @@ WhatsApp media relay bot for groups. It watches enabled WhatsApp groups for supp
 
 ## Persistent Data
 
-Compose mounts these host directories into container:
+Compose mounts these Docker volumes into container:
 
-- `./.wwebjs_auth` stores WhatsApp session auth.
-- `./.wwebjs_cache` stores WhatsApp Web cache.
-- `./data` stores SQLite database at `/app/data/bot.db`.
-- `./downloads` stores temporary downloaded media.
+- `wpdbot-auth` stores WhatsApp session auth at `/app/.wwebjs_auth`.
+- `wpdbot-cache` stores WhatsApp Web cache at `/app/.wwebjs_cache`.
+- `wpdbot-data` stores SQLite database at `/data/bot.db`.
+- `wpdbot-downloads` stores temporary downloaded media at `/tmp/wpdbot-downloads`.
 
-Do not commit `.env`, WhatsApp auth/cache, database files, or downloads.
+Do not commit `.env`, WhatsApp auth/cache, database files, or downloads. The container runs as a non-root user, and image-created mount points are owned by that user.
 
 ## Safety
 

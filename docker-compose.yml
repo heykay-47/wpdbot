@@ -4,11 +4,17 @@ services:
     env_file:
       - .env
     environment:
-      SQLITE_PATH: /app/data/bot.db
-      DOWNLOAD_DIR: /app/downloads
+      SQLITE_PATH: /data/bot.db
+      DOWNLOAD_DIR: /tmp/wpdbot-downloads
     restart: unless-stopped
     volumes:
-      - ./.wwebjs_auth:/app/.wwebjs_auth
-      - ./.wwebjs_cache:/app/.wwebjs_cache
-      - ./data:/app/data
-      - ./downloads:/app/downloads
+      - wpdbot-auth:/app/.wwebjs_auth
+      - wpdbot-cache:/app/.wwebjs_cache
+      - wpdbot-data:/data
+      - wpdbot-downloads:/tmp/wpdbot-downloads
+
+volumes:
+  wpdbot-auth:
+  wpdbot-cache:
+  wpdbot-data:
+  wpdbot-downloads:
