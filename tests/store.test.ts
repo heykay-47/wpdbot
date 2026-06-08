@@ -7,10 +7,10 @@ import { createStore, type Store } from '../src/store';
 let tempDirs: string[] = [];
 let stores: Store[] = [];
 
-function createTempStore(): Store {
+function createTempStore(defaults?: { maxFileSizeMb?: number; duplicateWindowHours?: number }): Store {
   const dir = mkdtempSync(join(tmpdir(), 'wpdbot-store-'));
   tempDirs.push(dir);
-  const store = createStore(join(dir, 'bot.sqlite'));
+  const store = createStore(join(dir, 'bot.sqlite'), defaults);
   stores.push(store);
   return store;
 }
@@ -36,6 +36,17 @@ describe('createStore', () => {
       enabled: false,
       maxFileSizeMb: 64,
       duplicateWindowHours: 24,
+    });
+  });
+
+  it('uses injected defaults for new group settings', () => {
+    const store = createTempStore({ maxFileSizeMb: 128, duplicateWindowHours: 6 });
+
+    expect(store.getGroupSettings('group-1@g.us')).toEqual({
+      groupId: 'group-1@g.us',
+      enabled: false,
+      maxFileSizeMb: 128,
+      duplicateWindowHours: 6,
     });
   });
 
@@ -72,6 +83,15 @@ describe('createStore', () => {
     expect(store.wasRecentlyPosted('group-1@g.us', 'hash-a', 4_000_000, 1)).toBe(false);
   });
 
+  it('does not replace newer duplicate timestamp with older timestamp', () => {
+    const store = createTempStore();
+
+    store.recordDuplicate('group-1@g.us', 'hash-a', 5_000);
+    store.recordDuplicate('group-1@g.us', 'hash-a', 1_000);
+
+    expect(store.wasRecentlyPosted('group-1@g.us', 'hash-a', 3_604_000, 1)).toBe(true);
+  });
+
   it('stores repost history count', () => {
     const store = createTempStore();
 
@@ -91,5 +111,19 @@ describe('createStore', () => {
     });
 
     expect(store.countReposts()).toBe(2);
+  });
+
+  it('stores and returns group metadata', () => {
+    const store = createTempStore();
+
+    expect(store.getGroupMetadata('group-1@g.us')).toBeNull();
+
+    store.setGroupMetadata('group-1@g.us', 'Family Group', 1_000);
+
+    expect(store.getGroupMetadata('group-1@g.us')).toEqual({
+      groupId: 'group-1@g.us',
+      name: 'Family Group',
+      updatedAtMs: 1_000,
+    });
   });
 });

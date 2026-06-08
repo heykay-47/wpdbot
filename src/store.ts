@@ -15,11 +15,24 @@ export type RepostRecord = {
   createdAtMs: number;
 };
 
+export type StoreDefaults = {
+  maxFileSizeMb?: number;
+  duplicateWindowHours?: number;
+};
+
+export type GroupMetadata = {
+  groupId: string;
+  name: string;
+  updatedAtMs: number;
+};
+
 export type Store = {
   getGroupSettings(groupId: string): GroupSettings;
   setGroupEnabled(groupId: string, enabled: boolean): void;
   recordDuplicate(groupId: string, urlHash: string, createdAtMs: number): void;
   wasRecentlyPosted(groupId: string, urlHash: string, nowMs: number, windowHours: number): boolean;
+  setGroupMetadata(groupId: string, name: string, updatedAtMs: number): void;
+  getGroupMetadata(groupId: string): GroupMetadata | null;
   recordRepost(record: RepostRecord): void;
   countReposts(): number;
   close(): void;
@@ -36,6 +49,12 @@ type DuplicateRow = {
   created_at_ms: number;
 };
 
+type GroupMetadataRow = {
+  group_id: string;
+  name: string;
+  updated_at_ms: number;
+};
+
 type CountRow = {
   count: number;
 };
@@ -43,8 +62,10 @@ type CountRow = {
 const defaultMaxFileSizeMb = 64;
 const defaultDuplicateWindowHours = 24;
 
-export function createStore(path: string): Store {
+export function createStore(path: string, defaults: StoreDefaults = {}): Store {
   const db = new Database(path);
+  const maxFileSizeMb = defaults.maxFileSizeMb ?? defaultMaxFileSizeMb;
+  const duplicateWindowHours = defaults.duplicateWindowHours ?? defaultDuplicateWindowHours;
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS group_settings (
@@ -69,6 +90,12 @@ export function createStore(path: string): Store {
       url_hash TEXT NOT NULL,
       created_at_ms INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS group_metadata (
+      group_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    );
   `);
 
   const insertDefaultSettings = db.prepare(`
@@ -88,7 +115,7 @@ export function createStore(path: string): Store {
   const upsertDuplicate = db.prepare(`
     INSERT INTO duplicate_urls (group_id, url_hash, created_at_ms)
     VALUES (?, ?, ?)
-    ON CONFLICT(group_id, url_hash) DO UPDATE SET created_at_ms = excluded.created_at_ms
+    ON CONFLICT(group_id, url_hash) DO UPDATE SET created_at_ms = max(duplicate_urls.created_at_ms, excluded.created_at_ms)
   `);
   const selectDuplicate = db.prepare<[string, string], DuplicateRow>(`
     SELECT created_at_ms
@@ -99,6 +126,16 @@ export function createStore(path: string): Store {
     INSERT INTO repost_history (group_id, sender_id, url, url_hash, created_at_ms)
     VALUES (?, ?, ?, ?, ?)
   `);
+  const upsertGroupMetadata = db.prepare(`
+    INSERT INTO group_metadata (group_id, name, updated_at_ms)
+    VALUES (?, ?, ?)
+    ON CONFLICT(group_id) DO UPDATE SET name = excluded.name, updated_at_ms = excluded.updated_at_ms
+  `);
+  const selectGroupMetadata = db.prepare<string, GroupMetadataRow>(`
+    SELECT group_id, name, updated_at_ms
+    FROM group_metadata
+    WHERE group_id = ?
+  `);
   const selectRepostCount = db.prepare<[], CountRow>(`
     SELECT COUNT(*) AS count
     FROM repost_history
@@ -106,7 +143,7 @@ export function createStore(path: string): Store {
 
   return {
     getGroupSettings(groupId) {
-      insertDefaultSettings.run(groupId, defaultMaxFileSizeMb, defaultDuplicateWindowHours);
+      insertDefaultSettings.run(groupId, maxFileSizeMb, duplicateWindowHours);
       const row = selectSettings.get(groupId);
 
       if (!row) {
@@ -122,7 +159,7 @@ export function createStore(path: string): Store {
     },
 
     setGroupEnabled(groupId, enabled) {
-      insertDefaultSettings.run(groupId, defaultMaxFileSizeMb, defaultDuplicateWindowHours);
+      insertDefaultSettings.run(groupId, maxFileSizeMb, duplicateWindowHours);
       updateEnabled.run(enabled ? 1 : 0, groupId);
     },
 
@@ -137,6 +174,23 @@ export function createStore(path: string): Store {
       }
 
       return nowMs - row.created_at_ms <= windowHours * 60 * 60 * 1000;
+    },
+
+    setGroupMetadata(groupId, name, updatedAtMs) {
+      upsertGroupMetadata.run(groupId, name, updatedAtMs);
+    },
+
+    getGroupMetadata(groupId) {
+      const row = selectGroupMetadata.get(groupId);
+      if (!row) {
+        return null;
+      }
+
+      return {
+        groupId: row.group_id,
+        name: row.name,
+        updatedAtMs: row.updated_at_ms,
+      };
     },
 
     recordRepost(record) {
