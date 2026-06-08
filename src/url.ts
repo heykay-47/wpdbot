@@ -28,7 +28,7 @@ function platformForUrl(value: string): SupportedPlatform | null {
 }
 
 function trimUrlCandidate(value: string): string {
-  return value.replace(/[),.!?]+$/u, '');
+  return value.replace(/[\])}.,!?';:]+$/u, '');
 }
 
 export function normalizeUrlForDuplicate(value: string): string {
@@ -43,6 +43,7 @@ export function normalizeUrlForDuplicate(value: string): string {
       url.searchParams.delete(key);
     }
   }
+  url.searchParams.sort();
 
   while (url.pathname.length > 1 && url.pathname.endsWith('/')) {
     url.pathname = url.pathname.slice(0, -1);

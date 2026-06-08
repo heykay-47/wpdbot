@@ -40,6 +40,10 @@ describe('extractFirstSupportedUrl', () => {
     expect(normalizeUrlForDuplicate(result?.url ?? '')).toBe('https://www.instagram.com/reel/C123');
   });
 
+  it.each([']', '}', "'", ';', ':'] as const)('strips trailing message punctuation %s', (punctuation) => {
+    expect(extractFirstSupportedUrl(`watch https://youtu.be/abc123${punctuation}`)?.url).toBe('https://youtu.be/abc123');
+  });
+
   it('normalizes url for duplicate checks', () => {
     expect(normalizeUrlForDuplicate('HTTPS://YOUTU.BE/abc123?utm_source=x')).toBe('https://youtu.be/abc123');
   });
@@ -47,6 +51,12 @@ describe('extractFirstSupportedUrl', () => {
   it('removes tracking params, hash, and trailing slash when normalizing', () => {
     expect(normalizeUrlForDuplicate('http://WWW.INSTAGRAM.COM/reel/C123/?igsh=abc&fbclid=def#frag')).toBe(
       'https://www.instagram.com/reel/C123',
+    );
+  });
+
+  it('sorts remaining query params when normalizing', () => {
+    expect(normalizeUrlForDuplicate('https://www.youtube.com/watch?z=last&a=first&utm_source=x')).toBe(
+      'https://www.youtube.com/watch?a=first&z=last',
     );
   });
 });
