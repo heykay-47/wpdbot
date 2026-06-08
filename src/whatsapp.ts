@@ -1,5 +1,8 @@
+import { rm } from 'node:fs/promises';
+import { dirname, extname, join, basename } from 'node:path';
 import qrcode from 'qrcode-terminal';
 import whatsappWeb from 'whatsapp-web.js';
+import { execa } from 'execa';
 import { canManageGroup, parseCommand } from './commands.js';
 import { handleIncomingMessage, type IncomingMessage, type RelayDownloader } from './relay.js';
 import type { AppConfig } from './config.js';
@@ -88,12 +91,22 @@ export function createWhatsappBot({ config, store, downloader }: CreateWhatsappB
     async sendVideo(groupId, filePath, caption) {
       const media = MessageMedia.fromFilePath(filePath);
       let sent: unknown;
+      let transcodedPath: string | null = null;
 
       try {
         sent = await client.sendMessage(groupId, media, { caption });
       } catch (error) {
-        console.error('Video upload failed; retrying as document', error);
-        sent = await client.sendMessage(groupId, media, { caption, sendMediaAsDocument: true });
+        console.error('Video upload failed; retrying after WhatsApp transcode', error);
+
+        try {
+          transcodedPath = await transcodeForWhatsapp(filePath);
+          sent = await client.sendMessage(groupId, MessageMedia.fromFilePath(transcodedPath), { caption });
+        } catch (transcodeOrUploadError) {
+          console.error('Transcoded video upload failed; retrying as document', transcodeOrUploadError);
+          sent = await client.sendMessage(groupId, media, { caption, sendMediaAsDocument: true });
+        } finally {
+          if (transcodedPath) await rm(transcodedPath, { force: true }).catch(() => undefined);
+        }
       }
 
       return messageId(sent) ?? '';
@@ -281,4 +294,37 @@ function addIdCandidate(candidates: Set<string>, value: string | null | undefine
     candidates.add(`${trimmed}@c.us`);
     candidates.add(`${trimmed}@lid`);
   }
+}
+
+async function transcodeForWhatsapp(filePath: string): Promise<string> {
+  const extension = extname(filePath);
+  const baseName = basename(filePath, extension);
+  const outputPath = join(dirname(filePath), `${baseName}.whatsapp.mp4`);
+
+  await execa('ffmpeg', [
+    '-y',
+    '-i',
+    filePath,
+    '-vf',
+    'scale=trunc(min(1280\,iw)/2)*2:-2',
+    '-c:v',
+    'libx264',
+    '-preset',
+    'veryfast',
+    '-pix_fmt',
+    'yuv420p',
+    '-profile:v',
+    'baseline',
+    '-level',
+    '3.1',
+    '-c:a',
+    'aac',
+    '-b:a',
+    '128k',
+    '-movflags',
+    '+faststart',
+    outputPath,
+  ]);
+
+  return outputPath;
 }

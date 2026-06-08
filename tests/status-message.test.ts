@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 
+const execaMock = vi.hoisted(() => vi.fn(async () => ({ stdout: '' })));
+
 const clients: MockClient[] = [];
 const mediaPaths: string[] = [];
 const deletedMessages: Array<{ delete: ReturnType<typeof vi.fn> }> = [];
@@ -61,6 +63,10 @@ vi.mock('whatsapp-web.js', () => ({
   },
 }));
 
+vi.mock('execa', () => ({
+  execa: execaMock,
+}));
+
 describe('formatStatus', () => {
   test('formats enabled group status exactly', async () => {
     const { formatStatus } = await import('../src/whatsapp');
@@ -87,6 +93,7 @@ describe('createWhatsappBot', () => {
     clients.length = 0;
     mediaPaths.length = 0;
     deletedMessages.length = 0;
+    execaMock.mockClear();
     vi.clearAllMocks();
   });
 
@@ -227,23 +234,43 @@ describe('createWhatsappBot', () => {
     expect(deletedMessages[0].delete).toHaveBeenCalledWith(true);
   });
 
-  test('relayWhatsapp retries media upload as document when video upload fails', async () => {
+  test('relayWhatsapp transcodes and retries inline video before document fallback', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const { createWhatsappBot } = await import('../src/whatsapp');
     const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
     clients[0].sendMessage
       .mockRejectedValueOnce(new Error('t'))
+      .mockResolvedValueOnce({ id: { _serialized: 'transcoded-video-id' } });
+
+    const sentId = await bot.relayWhatsapp.sendVideo('group-1@g.us', '/tmp/reel.mp4', 'caption');
+
+    expect(sentId).toBe('transcoded-video-id');
+    expect(execaMock).toHaveBeenCalledWith('ffmpeg', expect.arrayContaining(['-i', '/tmp/reel.mp4']));
+    expect(clients[0].sendMessage).toHaveBeenNthCalledWith(1, 'group-1@g.us', expect.any(MockMessageMedia), { caption: 'caption' });
+    expect(clients[0].sendMessage).toHaveBeenNthCalledWith(2, 'group-1@g.us', expect.any(MockMessageMedia), {
+      caption: 'caption',
+    });
+    expect((clients[0].sendMessage.mock.calls[1][1] as MockMessageMedia).filePath).toBe('/tmp/reel.whatsapp.mp4');
+    expect(consoleError).toHaveBeenCalledWith('Video upload failed; retrying after WhatsApp transcode', expect.any(Error));
+  });
+
+  test('relayWhatsapp uses document only after transcoded inline retry fails', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
+    clients[0].sendMessage
+      .mockRejectedValueOnce(new Error('first failed'))
+      .mockRejectedValueOnce(new Error('second failed'))
       .mockResolvedValueOnce({ id: { _serialized: 'document-message-id' } });
 
     const sentId = await bot.relayWhatsapp.sendVideo('group-1@g.us', '/tmp/reel.mp4', 'caption');
 
     expect(sentId).toBe('document-message-id');
-    expect(clients[0].sendMessage).toHaveBeenNthCalledWith(1, 'group-1@g.us', expect.any(MockMessageMedia), { caption: 'caption' });
-    expect(clients[0].sendMessage).toHaveBeenNthCalledWith(2, 'group-1@g.us', expect.any(MockMessageMedia), {
+    expect(clients[0].sendMessage).toHaveBeenNthCalledWith(3, 'group-1@g.us', expect.any(MockMessageMedia), {
       caption: 'caption',
       sendMediaAsDocument: true,
     });
-    expect(consoleError).toHaveBeenCalledWith('Video upload failed; retrying as document', expect.any(Error));
+    expect(consoleError).toHaveBeenCalledWith('Transcoded video upload failed; retrying as document', expect.any(Error));
   });
 });
 
