@@ -117,6 +117,24 @@ describe('createDownloader', () => {
     expect(existsSync(downloadSubdir)).toBe(false);
   });
 
+  it('sanitizes Facebook extractor parse failures', async () => {
+    const downloadDir = join(createTempDir(), 'downloads');
+    let downloadSubdir = '';
+    const runner: DownloaderRunner = async (_file, args) => {
+      const outputTemplate = args[args.indexOf('--output') + 1];
+      downloadSubdir = dirname(outputTemplate);
+      mkdirSync(downloadSubdir, { recursive: true });
+      throw new Error(
+        "Command failed with exit code 1: yt-dlp --no-playlist 'https://www.facebook.com/share/p/1EDU8P8DV4/'\n\nERROR: [facebook] 1523901521039742: Cannot parse data; please report this issue",
+      );
+    };
+
+    await expect(createDownloader({ downloadDir, runner }).download('https://www.facebook.com/share/p/1EDU8P8DV4/', 64)).rejects.toThrow(
+      'Facebook post could not be downloaded. It may not contain a public video, or Facebook changed the page format.',
+    );
+    expect(existsSync(downloadSubdir)).toBe(false);
+  });
+
   it('removes the download directory when yt-dlp prints no file path', async () => {
     const downloadDir = join(createTempDir(), 'downloads');
     let downloadSubdir = '';
