@@ -226,6 +226,25 @@ describe('createWhatsappBot', () => {
     expect(clients[0].getMessageById).toHaveBeenCalledWith('message-1');
     expect(deletedMessages[0].delete).toHaveBeenCalledWith(true);
   });
+
+  test('relayWhatsapp retries media upload as document when video upload fails', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
+    clients[0].sendMessage
+      .mockRejectedValueOnce(new Error('t'))
+      .mockResolvedValueOnce({ id: { _serialized: 'document-message-id' } });
+
+    const sentId = await bot.relayWhatsapp.sendVideo('group-1@g.us', '/tmp/reel.mp4', 'caption');
+
+    expect(sentId).toBe('document-message-id');
+    expect(clients[0].sendMessage).toHaveBeenNthCalledWith(1, 'group-1@g.us', expect.any(MockMessageMedia), { caption: 'caption' });
+    expect(clients[0].sendMessage).toHaveBeenNthCalledWith(2, 'group-1@g.us', expect.any(MockMessageMedia), {
+      caption: 'caption',
+      sendMediaAsDocument: true,
+    });
+    expect(consoleError).toHaveBeenCalledWith('Video upload failed; retrying as document', expect.any(Error));
+  });
 });
 
 function baseConfig() {

@@ -86,7 +86,16 @@ export function createWhatsappBot({ config, store, downloader }: CreateWhatsappB
 
   const relayWhatsapp: WhatsappRelay = {
     async sendVideo(groupId, filePath, caption) {
-      const sent = await client.sendMessage(groupId, MessageMedia.fromFilePath(filePath), { caption });
+      const media = MessageMedia.fromFilePath(filePath);
+      let sent: unknown;
+
+      try {
+        sent = await client.sendMessage(groupId, media, { caption });
+      } catch (error) {
+        console.error('Video upload failed; retrying as document', error);
+        sent = await client.sendMessage(groupId, media, { caption, sendMediaAsDocument: true });
+      }
+
       return messageId(sent) ?? '';
     },
 
