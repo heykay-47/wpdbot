@@ -15,5 +15,14 @@ export type ManageCheckInput = {
 };
 
 export function canManageGroup(input: ManageCheckInput): boolean {
-  return input.senderId === input.ownerId || input.senderIsGroupAdmin;
+  const ownerId = input.ownerId.includes('@') ? input.ownerId : `${input.ownerId}@c.us`;
+  return input.senderId === ownerId || input.senderIsGroupAdmin;
+}
+
+export type EnableCheckInput = ManageCheckInput & {
+  botIsGroupAdmin: boolean;
+};
+
+export function canEnableGroup(input: EnableCheckInput): boolean {
+  return canManageGroup(input) && input.botIsGroupAdmin;
 }
