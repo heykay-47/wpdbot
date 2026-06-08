@@ -100,4 +100,50 @@ describe('createDownloader', () => {
     expect(existsSync(filePath)).toBe(false);
     expect(existsSync(downloadSubdir)).toBe(false);
   });
+
+  it('removes the download directory when the runner rejects', async () => {
+    const downloadDir = join(createTempDir(), 'downloads');
+    let downloadSubdir = '';
+    const runner: DownloaderRunner = async (_file, args) => {
+      const outputTemplate = args[args.indexOf('--output') + 1];
+      downloadSubdir = dirname(outputTemplate);
+      mkdirSync(downloadSubdir, { recursive: true });
+      throw new Error('yt-dlp failed');
+    };
+
+    await expect(createDownloader({ downloadDir, runner }).download('https://youtu.be/example', 1)).rejects.toThrow(
+      'yt-dlp failed',
+    );
+    expect(existsSync(downloadSubdir)).toBe(false);
+  });
+
+  it('removes the download directory when yt-dlp prints no file path', async () => {
+    const downloadDir = join(createTempDir(), 'downloads');
+    let downloadSubdir = '';
+    const runner: DownloaderRunner = async (_file, args) => {
+      const outputTemplate = args[args.indexOf('--output') + 1];
+      downloadSubdir = dirname(outputTemplate);
+      mkdirSync(downloadSubdir, { recursive: true });
+      return { stdout: '\n' };
+    };
+
+    await expect(createDownloader({ downloadDir, runner }).download('https://youtu.be/example', 1)).rejects.toThrow(
+      'yt-dlp did not print downloaded file path',
+    );
+    expect(existsSync(downloadSubdir)).toBe(false);
+  });
+
+  it('removes the download directory when the printed file path is missing', async () => {
+    const downloadDir = join(createTempDir(), 'downloads');
+    let downloadSubdir = '';
+    const runner: DownloaderRunner = async (_file, args) => {
+      const outputTemplate = args[args.indexOf('--output') + 1];
+      downloadSubdir = dirname(outputTemplate);
+      mkdirSync(downloadSubdir, { recursive: true });
+      return { stdout: `${join(downloadSubdir, 'missing.mp4')}\n` };
+    };
+
+    await expect(createDownloader({ downloadDir, runner }).download('https://youtu.be/example', 1)).rejects.toThrow();
+    expect(existsSync(downloadSubdir)).toBe(false);
+  });
 });
