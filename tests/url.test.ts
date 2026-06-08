@@ -21,6 +21,7 @@ describe('extractFirstSupportedUrl', () => {
     ['https://youtube.com/watch?v=abc123', 'youtube'],
     ['https://m.youtube.com/watch?v=abc123', 'youtube'],
     ['https://instagram.com/p/C123/', 'instagram'],
+    ['https://m.instagram.com/reel/C123/', 'instagram'],
     ['https://facebook.com/watch/?v=123', 'facebook'],
     ['https://m.facebook.com/watch/?v=123', 'facebook'],
     ['https://fb.watch/abc123/', 'facebook'],
@@ -30,6 +31,13 @@ describe('extractFirstSupportedUrl', () => {
 
   it('extracts the first supported link only', () => {
     expect(extractFirstSupportedUrl('see https://example.com then https://instagram.com/p/C123/')?.platform).toBe('instagram');
+  });
+
+  it('preserves original extracted url while normalization removes tracking params', () => {
+    const result = extractFirstSupportedUrl('reel https://www.instagram.com/reel/C123/?igsh=abc!');
+
+    expect(result?.url).toBe('https://www.instagram.com/reel/C123/?igsh=abc');
+    expect(normalizeUrlForDuplicate(result?.url ?? '')).toBe('https://www.instagram.com/reel/C123');
   });
 
   it('normalizes url for duplicate checks', () => {

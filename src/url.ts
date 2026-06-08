@@ -9,6 +9,7 @@ const PLATFORM_HOSTS = new Map<string, SupportedPlatform>([
   ['youtu.be', 'youtube'],
   ['instagram.com', 'instagram'],
   ['www.instagram.com', 'instagram'],
+  ['m.instagram.com', 'instagram'],
   ['facebook.com', 'facebook'],
   ['www.facebook.com', 'facebook'],
   ['m.facebook.com', 'facebook'],
@@ -57,7 +58,7 @@ export function extractFirstSupportedUrl(body: string): SupportedUrl | null {
     if (platform) {
       return {
         platform,
-        url: normalizeUrlForDuplicate(candidate),
+        url: candidate,
       };
     }
   }
