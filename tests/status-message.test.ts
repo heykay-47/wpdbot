@@ -246,6 +246,7 @@ describe('createWhatsappBot', () => {
 
     expect(sentId).toBe('transcoded-video-id');
     expect(execaMock).toHaveBeenCalledWith('ffmpeg', expect.arrayContaining(['-i', '/tmp/reel.mp4']));
+    expect(execaMock.mock.calls[0][1]).toContain('scale=1280:-2:force_original_aspect_ratio=decrease');
     expect(clients[0].sendMessage).toHaveBeenNthCalledWith(1, 'group-1@g.us', expect.any(MockMessageMedia), { caption: 'caption' });
     expect(clients[0].sendMessage).toHaveBeenNthCalledWith(2, 'group-1@g.us', expect.any(MockMessageMedia), {
       caption: 'caption',

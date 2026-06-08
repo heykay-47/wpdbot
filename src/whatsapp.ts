@@ -306,7 +306,7 @@ async function transcodeForWhatsapp(filePath: string): Promise<string> {
     '-i',
     filePath,
     '-vf',
-    'scale=trunc(min(1280\,iw)/2)*2:-2',
+    'scale=1280:-2:force_original_aspect_ratio=decrease',
     '-c:v',
     'libx264',
     '-preset',
