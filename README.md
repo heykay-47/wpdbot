@@ -46,7 +46,21 @@ WhatsApp media relay bot for groups. It watches enabled WhatsApp groups for supp
    docker compose logs -f
    ```
 
+6. Add bot WhatsApp account to target group and make it group admin.
+
+7. In group chat, send `!bot enable` from group admin or configured owner account.
+
+8. Send supported YouTube, Instagram, or Facebook link in enabled group to test relay.
+
 ## Commands
+
+Bot commands:
+
+- `!bot enable` enables relay for current group. Bot must be group admin.
+- `!bot disable` disables relay for current group.
+- `!bot status` shows current group settings and bot admin status.
+
+Docker commands:
 
 - `docker compose up -d` starts bot in background.
 - `docker compose logs -f` tails QR/login/runtime logs.
@@ -69,6 +83,7 @@ Do not commit `.env`, WhatsApp auth/cache, database files, or downloads. The con
 
 - Use dedicated WhatsApp account if possible. Automation can violate platform terms or trigger account restrictions.
 - Enable bot only in groups where members consent to reposting media.
+- Original link message is deleted only after successful repost. Failed downloads or uploads keep original message in chat.
 - Keep `MAX_FILE_SIZE_MB` reasonable to avoid disk and bandwidth spikes.
 - Keep `downloads` and `data` on storage with enough free space.
 - Protect `.env` and `.wwebjs_auth`; anyone with them may control bot session.
