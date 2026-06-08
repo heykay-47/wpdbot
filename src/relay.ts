@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import { basename, dirname, relative, resolve } from 'node:path';
-import { formatCaption } from './caption';
-import { extractFirstSupportedUrl, normalizeUrlForDuplicate } from './url';
-import type { Store } from './store';
+import { formatCaption } from './caption.js';
+import { extractFirstSupportedUrl, normalizeUrlForDuplicate } from './url.js';
+import type { Store } from './store.js';
 
 export type IncomingMessage = {
   id: string;

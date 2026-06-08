@@ -54,9 +54,11 @@ vi.mock('qrcode-terminal', () => ({
 }));
 
 vi.mock('whatsapp-web.js', () => ({
-  Client: MockClient,
-  LocalAuth: MockLocalAuth,
-  MessageMedia: MockMessageMedia,
+  default: {
+    Client: MockClient,
+    LocalAuth: MockLocalAuth,
+    MessageMedia: MockMessageMedia,
+  },
 }));
 
 describe('formatStatus', () => {
@@ -68,6 +70,15 @@ describe('formatStatus', () => {
     expect(status).toBe(
       'Bot status: enabled\nMax size: 64 MB\nDuplicate window: 24 hours\nSupported: YouTube, Instagram, Facebook\nBot admin: yes',
     );
+  });
+});
+
+describe('index entrypoint', () => {
+  test('can be imported without starting WhatsApp', async () => {
+    const index = await import('../src/index');
+
+    expect(index.main).toEqual(expect.any(Function));
+    expect(clients).toHaveLength(0);
   });
 });
 

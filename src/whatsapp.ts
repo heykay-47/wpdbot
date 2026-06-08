@@ -1,9 +1,11 @@
 import qrcode from 'qrcode-terminal';
-import { Client, LocalAuth, MessageMedia } from 'whatsapp-web.js';
-import { canEnableGroup, canManageGroup, parseCommand } from './commands';
-import { handleIncomingMessage, type IncomingMessage, type RelayDownloader } from './relay';
-import type { AppConfig } from './config';
-import type { Store } from './store';
+import whatsappWeb from 'whatsapp-web.js';
+import { canEnableGroup, canManageGroup, parseCommand } from './commands.js';
+import { handleIncomingMessage, type IncomingMessage, type RelayDownloader } from './relay.js';
+import type { AppConfig } from './config.js';
+import type { Store } from './store.js';
+
+const { Client, LocalAuth, MessageMedia } = whatsappWeb;
 
 export type StatusInput = {
   enabled: boolean;
@@ -19,7 +21,7 @@ export type WhatsappRelay = {
 };
 
 export type WhatsappBot = {
-  client: Client;
+  client: InstanceType<typeof Client>;
   relayWhatsapp: WhatsappRelay;
   start(): void;
 };
@@ -104,7 +106,7 @@ export function createWhatsappBot({ config, store, downloader }: CreateWhatsappB
 
 async function handleWhatsappMessage(
   message: WhatsappMessage,
-  client: Client,
+  client: InstanceType<typeof Client>,
   config: AppConfig,
   store: Store,
   relayWhatsapp: WhatsappRelay,
@@ -194,7 +196,7 @@ function participantIsAdmin(participants: WhatsappParticipant[] | undefined, id:
   return Boolean(participants?.some((participant) => normalizeId(serializedId(participant.id) ?? '') === normalizedId && (participant.isAdmin || participant.isSuperAdmin)));
 }
 
-function currentBotId(client: Client): string | null {
+function currentBotId(client: InstanceType<typeof Client>): string | null {
   const info = (client as unknown as { info?: { wid?: { _serialized?: string; user?: string } } }).info;
   if (!info?.wid) return null;
   return info.wid._serialized ?? (info.wid.user ? `${info.wid.user}@c.us` : null);

@@ -1,4 +1,4 @@
-import type { SupportedPlatform, SupportedUrl } from './types';
+import type { SupportedPlatform, SupportedUrl } from './types.js';
 
 const URL_PATTERN = /https?:\/\/[^\s<>"]+/gi;
 
