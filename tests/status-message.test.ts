@@ -103,7 +103,9 @@ describe('createWhatsappBot', () => {
     const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
 
     expect(clients).toHaveLength(1);
-    expect(clients[0].options).toMatchObject({ puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox'] } });
+    expect(clients[0].options).toMatchObject({
+      puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] },
+    });
     expect((clients[0].options as { authStrategy: MockLocalAuth }).authStrategy).toBeInstanceOf(MockLocalAuth);
     bot.start();
     expect(clients[0].initialize).toHaveBeenCalledOnce();
@@ -246,7 +248,17 @@ describe('createWhatsappBot', () => {
 
     expect(sentId).toBe('transcoded-video-id');
     expect(execaMock).toHaveBeenCalledWith('ffmpeg', expect.arrayContaining(['-i', '/tmp/reel.mp4']));
-    expect(execaMock.mock.calls[0][1]).toContain('scale=1280:-2:force_original_aspect_ratio=decrease');
+    expect(execaMock.mock.calls[0][1]).toEqual(
+      expect.arrayContaining([
+        'scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2',
+        '-crf',
+        '28',
+        '-maxrate',
+        '1400k',
+        '-bufsize',
+        '2800k',
+      ]),
+    );
     expect(clients[0].sendMessage).toHaveBeenNthCalledWith(1, 'group-1@g.us', expect.any(MockMessageMedia), { caption: 'caption' });
     expect(clients[0].sendMessage).toHaveBeenNthCalledWith(2, 'group-1@g.us', expect.any(MockMessageMedia), {
       caption: 'caption',
@@ -272,6 +284,20 @@ describe('createWhatsappBot', () => {
       sendMediaAsDocument: true,
     });
     expect(consoleError).toHaveBeenCalledWith('Transcoded video upload failed; retrying as document', expect.any(Error));
+  });
+
+  test('relayWhatsapp does not try document fallback after browser target closes', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
+    clients[0].sendMessage
+      .mockRejectedValueOnce(new Error('t'))
+      .mockRejectedValueOnce(new Error("Attempted to use detached Frame 'abc'."));
+
+    await expect(bot.relayWhatsapp.sendVideo('group-1@g.us', '/tmp/reel.mp4', 'caption')).rejects.toThrow('detached Frame');
+
+    expect(clients[0].sendMessage).toHaveBeenCalledTimes(2);
+    expect(consoleError).toHaveBeenCalledWith('Transcoded video upload failed; browser target closed', expect.any(Error));
   });
 });
 

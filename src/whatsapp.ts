@@ -84,7 +84,7 @@ export function formatStatus({ enabled, maxFileSizeMb, duplicateWindowHours, bot
 export function createWhatsappBot({ config, store, downloader }: CreateWhatsappBotInput): WhatsappBot {
   const client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox'] },
+    puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] },
   });
 
   const relayWhatsapp: WhatsappRelay = {
@@ -102,6 +102,11 @@ export function createWhatsappBot({ config, store, downloader }: CreateWhatsappB
           transcodedPath = await transcodeForWhatsapp(filePath);
           sent = await client.sendMessage(groupId, MessageMedia.fromFilePath(transcodedPath), { caption });
         } catch (transcodeOrUploadError) {
+          if (isBrowserTargetClosedError(transcodeOrUploadError)) {
+            console.error('Transcoded video upload failed; browser target closed', transcodeOrUploadError);
+            throw transcodeOrUploadError;
+          }
+
           console.error('Transcoded video upload failed; retrying as document', transcodeOrUploadError);
           sent = await client.sendMessage(groupId, media, { caption, sendMediaAsDocument: true });
         } finally {
@@ -296,6 +301,11 @@ function addIdCandidate(candidates: Set<string>, value: string | null | undefine
   }
 }
 
+function isBrowserTargetClosedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('Target closed') || message.includes('detached Frame');
+}
+
 async function transcodeForWhatsapp(filePath: string): Promise<string> {
   const extension = extname(filePath);
   const baseName = basename(filePath, extension);
@@ -306,11 +316,17 @@ async function transcodeForWhatsapp(filePath: string): Promise<string> {
     '-i',
     filePath,
     '-vf',
-    'scale=1280:-2:force_original_aspect_ratio=decrease',
+    'scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2',
     '-c:v',
     'libx264',
     '-preset',
     'veryfast',
+    '-crf',
+    '28',
+    '-maxrate',
+    '1400k',
+    '-bufsize',
+    '2800k',
     '-pix_fmt',
     'yuv420p',
     '-profile:v',
