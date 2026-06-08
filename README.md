@@ -87,3 +87,16 @@ Do not commit `.env`, WhatsApp auth/cache, database files, or downloads. The con
 - Keep `MAX_FILE_SIZE_MB` reasonable to avoid disk and bandwidth spikes.
 - Keep `downloads` and `data` on storage with enough free space.
 - Protect `.env` and `.wwebjs_auth`; anyone with them may control bot session.
+
+## Manual Smoke Test
+
+- Create a private WhatsApp test group.
+- Add bot account and make it group admin.
+- Start the container and scan QR.
+- Send `!bot status`; confirm bot admin shows `yes`.
+- Send `!bot enable`; confirm enabled response.
+- Send one YouTube link; confirm repost, caption, and original deletion.
+- Send one Instagram link; confirm repost or clear failure message.
+- Send one Facebook link; confirm repost or clear failure message.
+- Send the same link again within 24 hours; confirm duplicate skip.
+- Send `!bot disable`; confirm future links are ignored.
