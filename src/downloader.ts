@@ -1,4 +1,4 @@
-import { mkdir, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { execa } from 'execa';
 
@@ -19,6 +19,7 @@ export function createDownloader({ downloadDir, runner = defaultRunner }: Downlo
   return {
     async download(url, maxFileSizeMb) {
       await mkdir(downloadDir, { recursive: true });
+      const tempDir = await mkdtemp(join(downloadDir, 'download-'));
 
       const { stdout } = await runner('yt-dlp', [
         '--no-playlist',
@@ -26,8 +27,10 @@ export function createDownloader({ downloadDir, runner = defaultRunner }: Downlo
         'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best',
         '--merge-output-format',
         'mp4',
+        '--max-filesize',
+        `${maxFileSizeMb}M`,
         '--output',
-        join(downloadDir, '%(title)s.%(ext)s'),
+        join(tempDir, '%(title)s.%(ext)s'),
         '--print',
         'after_move:filepath',
         url,
@@ -37,6 +40,8 @@ export function createDownloader({ downloadDir, runner = defaultRunner }: Downlo
 
       const { size } = await stat(filePath);
       if (size > maxFileSizeMb * 1024 * 1024) {
+        await rm(filePath, { force: true }).catch(() => undefined);
+        await rm(tempDir, { force: true, recursive: true }).catch(() => undefined);
         throw new Error(`Downloaded file exceeds ${maxFileSizeMb} MB`);
       }
 

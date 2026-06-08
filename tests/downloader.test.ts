@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createDownloader, type DownloaderRunner } from '../src/downloader';
 
@@ -22,11 +22,13 @@ afterEach(() => {
 describe('createDownloader', () => {
   it('downloads to the configured directory and returns file size when within limit', async () => {
     const downloadDir = join(createTempDir(), 'downloads');
-    const filePath = join(downloadDir, 'video.mp4');
+    let filePath = '';
     const calls: Parameters<DownloaderRunner>[] = [];
     const runner: DownloaderRunner = async (...args) => {
       calls.push(args);
-      mkdirSync(downloadDir, { recursive: true });
+      const outputTemplate = args[1][args[1].indexOf('--output') + 1];
+      filePath = join(dirname(outputTemplate), 'video.mp4');
+      mkdirSync(dirname(filePath), { recursive: true });
       writeFileSync(filePath, Buffer.alloc(1024));
       return { stdout: `intermediate output\n${filePath}\n` };
     };
@@ -43,21 +45,51 @@ describe('createDownloader', () => {
           'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best',
           '--merge-output-format',
           'mp4',
+          '--max-filesize',
+          '1M',
           '--output',
-          join(downloadDir, '%(title)s.%(ext)s'),
+          join(dirname(filePath), '%(title)s.%(ext)s'),
           '--print',
           'after_move:filepath',
           'https://youtu.be/example',
         ],
       ],
     ]);
+    expect(dirname(filePath)).not.toBe(downloadDir);
+  });
+
+  it('uses a unique output directory for each download', async () => {
+    const downloadDir = join(createTempDir(), 'downloads');
+    const outputDirs: string[] = [];
+    const runner: DownloaderRunner = async (_file, args) => {
+      const outputTemplate = args[args.indexOf('--output') + 1];
+      const outputDir = dirname(outputTemplate);
+      const filePath = join(outputDir, 'video.mp4');
+      outputDirs.push(outputDir);
+      mkdirSync(outputDir, { recursive: true });
+      writeFileSync(filePath, Buffer.alloc(1024));
+      return { stdout: `${filePath}\n` };
+    };
+    const downloader = createDownloader({ downloadDir, runner });
+
+    await downloader.download('https://youtu.be/one', 1);
+    await downloader.download('https://youtu.be/two', 1);
+
+    expect(outputDirs).toHaveLength(2);
+    expect(outputDirs[0]).not.toBe(outputDirs[1]);
+    expect(outputDirs[0]).toContain(downloadDir);
+    expect(outputDirs[1]).toContain(downloadDir);
   });
 
   it('rejects downloaded files larger than the configured limit', async () => {
     const downloadDir = join(createTempDir(), 'downloads');
-    const filePath = join(downloadDir, 'large.mp4');
-    const runner: DownloaderRunner = async () => {
-      mkdirSync(downloadDir, { recursive: true });
+    let filePath = '';
+    let downloadSubdir = '';
+    const runner: DownloaderRunner = async (_file, args) => {
+      const outputTemplate = args[args.indexOf('--output') + 1];
+      downloadSubdir = dirname(outputTemplate);
+      filePath = join(downloadSubdir, 'large.mp4');
+      mkdirSync(downloadSubdir, { recursive: true });
       writeFileSync(filePath, Buffer.alloc(2 * 1024 * 1024));
       return { stdout: `${filePath}\n` };
     };
@@ -65,5 +97,7 @@ describe('createDownloader', () => {
     await expect(createDownloader({ downloadDir, runner }).download('https://youtu.be/example', 1)).rejects.toThrow(
       'Downloaded file exceeds 1 MB',
     );
+    expect(existsSync(filePath)).toBe(false);
+    expect(existsSync(downloadSubdir)).toBe(false);
   });
 });
