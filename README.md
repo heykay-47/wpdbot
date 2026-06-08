@@ -1,6 +1,6 @@
 # wpdbot
 
-WhatsApp media relay bot for groups. It watches enabled WhatsApp groups for supported social video links, downloads media with `yt-dlp`, reposts video, and removes duplicate links inside configured window.
+WhatsApp media relay bot for groups. It watches enabled WhatsApp groups for supported social video links, downloads media with `yt-dlp`, reposts video, and skips duplicate links inside configured window.
 
 ## Requirements
 
