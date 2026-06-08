@@ -52,6 +52,32 @@ WhatsApp media relay bot for groups. It watches enabled WhatsApp groups for supp
 
 8. Send supported YouTube, Instagram, or Facebook link in enabled group to test relay.
 
+## Local Development
+
+Docker is recommended because it includes Chromium and `yt-dlp` dependencies. For local WSL runs with `npm run dev`, install browser/runtime dependencies first:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y libnspr4 libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2t64 libxss1 libxshmfence1 libxrandr2 libxcomposite1 libxcursor1 libxdamage1 libxi6 libxtst6 fonts-liberation xdg-utils ffmpeg python3 python3-pip
+pip3 install --break-system-packages yt-dlp
+```
+
+Then use local paths in `.env`:
+
+```env
+SQLITE_PATH=./data/bot.db
+DOWNLOAD_DIR=./downloads
+```
+
+Run locally:
+
+```sh
+npm install
+npm run dev
+```
+
+Node 20 is the supported runtime. Newer Node versions may work but are not the target runtime.
+
 ## Commands
 
 Bot commands:
@@ -104,6 +130,6 @@ Do not commit `.env`, WhatsApp auth/cache, database files, or downloads. The con
 
 ## Final Verification
 
-- `npm test`: passed, 8 files, 70 tests.
+- `npm test`: passed, 8 files, 71 tests.
 - `npm run build`: passed.
 - `docker compose build`: not run; `docker` command unavailable in WSL.

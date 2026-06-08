@@ -1,3 +1,5 @@
+import { mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
 
 export type GroupSettings = {
@@ -71,6 +73,10 @@ const defaultDuplicateWindowHours = 24;
 const botOwnerIdKey = 'owner_id';
 
 export function createStore(path: string, defaults: StoreDefaults = {}): Store {
+  if (path !== ':memory:') {
+    mkdirSync(dirname(path), { recursive: true });
+  }
+
   const db = new Database(path);
   const maxFileSizeMb = defaults.maxFileSizeMb ?? defaultMaxFileSizeMb;
   const duplicateWindowHours = defaults.duplicateWindowHours ?? defaultDuplicateWindowHours;

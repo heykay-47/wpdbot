@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -37,6 +37,18 @@ describe('createStore', () => {
       maxFileSizeMb: 64,
       duplicateWindowHours: 24,
     });
+  });
+
+  it('creates missing database parent directory', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wpdbot-store-'));
+    tempDirs.push(dir);
+    const databasePath = join(dir, 'nested', 'bot.sqlite');
+
+    const store = createStore(databasePath);
+    stores.push(store);
+
+    expect(existsSync(join(dir, 'nested'))).toBe(true);
+    expect(store.getGroupSettings('group-1@g.us').enabled).toBe(false);
   });
 
   it('uses injected defaults for new group settings', () => {
