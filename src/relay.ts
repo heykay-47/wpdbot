@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { rm } from 'node:fs/promises';
+import { basename, dirname, relative, resolve } from 'node:path';
 import { formatCaption } from './caption';
 import { extractFirstSupportedUrl, normalizeUrlForDuplicate } from './url';
 import type { Store } from './store';
@@ -31,6 +32,7 @@ export type HandleIncomingMessageInput = {
   whatsapp: RelayWhatsapp;
   downloader: RelayDownloader;
   timezone: string;
+  downloadDir?: string;
   nowMs?: number;
   cleanupPath?: (filePath: string) => Promise<void>;
 };
@@ -39,8 +41,15 @@ function hashUrl(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
-async function defaultCleanupPath(filePath: string): Promise<void> {
-  await rm(filePath, { force: true }).catch(() => undefined);
+function isDirectDownloadSubdir(parentDir: string, downloadDir: string): boolean {
+  const relativeParent = relative(resolve(downloadDir), resolve(parentDir));
+  return basename(parentDir).startsWith('download-') && relativeParent !== '' && !relativeParent.startsWith('..') && !relativeParent.includes('..');
+}
+
+async function defaultCleanupPath(filePath: string, downloadDir?: string): Promise<void> {
+  const parentDir = dirname(filePath);
+  const target = downloadDir && isDirectDownloadSubdir(parentDir, downloadDir) ? parentDir : filePath;
+  await rm(target, { force: true, recursive: target === parentDir }).catch(() => undefined);
 }
 
 function errorMessage(error: unknown): string {
@@ -53,8 +62,9 @@ export async function handleIncomingMessage({
   whatsapp,
   downloader,
   timezone,
+  downloadDir,
   nowMs = Date.now(),
-  cleanupPath = defaultCleanupPath,
+  cleanupPath,
 }: HandleIncomingMessageInput): Promise<void> {
   if (!message.isGroup || message.fromMe) return;
 
@@ -118,6 +128,6 @@ export async function handleIncomingMessage({
       await whatsapp.sendText(message.groupId, `Video posted, but I could not save repost history: ${errorMessage(error)}`);
     }
   } finally {
-    if (filePath) await cleanupPath(filePath).catch(() => undefined);
+    if (filePath) await (cleanupPath ? cleanupPath(filePath) : defaultCleanupPath(filePath, downloadDir)).catch(() => undefined);
   }
 }

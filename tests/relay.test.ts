@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { handleIncomingMessage, type IncomingMessage, type RelayDownloader, type RelayWhatsapp } from '../src/relay';
 import type { Store } from '../src/store';
@@ -99,8 +99,8 @@ function createDownloader(filePath = '/tmp/video.mp4', overrides: Partial<RelayD
 
 const tempRoots: string[] = [];
 
-async function createDownloadedFile(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), 'wpdbot-relay-'));
+async function createDownloadedFile(rootPrefix = 'wpdbot-relay-'): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), rootPrefix));
   tempRoots.push(root);
   const downloadDir = join(root, 'download-abc');
   mkdirSync(downloadDir, { recursive: true });
@@ -165,6 +165,47 @@ describe('handleIncomingMessage', () => {
     });
     expect(cleanupCalls).toEqual([filePath]);
     expect(existsSync(filePath)).toBe(true);
+  });
+
+  it('default cleanup removes download subdirectory inside configured downloadDir after success', async () => {
+    const downloadRoot = await mkdtemp(join(tmpdir(), 'wpdbot-downloads-'));
+    tempRoots.push(downloadRoot);
+    const downloadSubdir = join(downloadRoot, 'download-abc');
+    mkdirSync(downloadSubdir, { recursive: true });
+    const filePath = join(downloadSubdir, 'video.mp4');
+    writeFileSync(filePath, 'video');
+    const store = createStore();
+    const whatsapp = createWhatsapp();
+    const downloader = createDownloader(filePath);
+
+    await handleIncomingMessage({ message: baseMessage, store, whatsapp, downloader, timezone: 'Asia/Kolkata', downloadDir: downloadRoot });
+
+    expect(existsSync(downloadSubdir)).toBe(false);
+    expect(existsSync(downloadRoot)).toBe(true);
+  });
+
+  it('default cleanup does not recursively remove download-looking parent outside configured downloadDir', async () => {
+    const filePath = await createDownloadedFile('wpdbot-outside-');
+    const siblingPath = join(dirname(filePath), 'keep.txt');
+    writeFileSync(siblingPath, 'keep');
+    const unrelatedDownloadRoot = await mkdtemp(join(tmpdir(), 'wpdbot-downloads-'));
+    tempRoots.push(unrelatedDownloadRoot);
+    const store = createStore();
+    const whatsapp = createWhatsapp();
+    const downloader = createDownloader(filePath);
+
+    await handleIncomingMessage({
+      message: baseMessage,
+      store,
+      whatsapp,
+      downloader,
+      timezone: 'Asia/Kolkata',
+      downloadDir: unrelatedDownloadRoot,
+    });
+
+    expect(existsSync(filePath)).toBe(false);
+    expect(existsSync(siblingPath)).toBe(true);
+    expect(existsSync(dirname(filePath))).toBe(true);
   });
 
   it('uses processing time for duplicate cache checks instead of message timestamp', async () => {
