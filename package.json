@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "dev": "tsx src/index.ts",
-    "start": "node dist/index.js",
+    "dev": "node -e \"console.log('src/index.ts is planned for Task 7')\"",
+    "start": "node -e \"console.log('dist/index.js is planned for Task 7')\"",
     "test": "vitest run",
     "test:watch": "vitest"
   },
