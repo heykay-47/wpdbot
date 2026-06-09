@@ -3,10 +3,9 @@ import { extractFirstSupportedUrl, normalizeUrlForDuplicate } from '../src/url';
 
 describe('extractFirstSupportedUrl', () => {
   it.each([
-    ['watch https://youtu.be/abc123 now', 'youtube'],
-    ['watch https://www.youtube.com/watch?v=abc123 now', 'youtube'],
+    ['short https://www.youtube.com/shorts/abc123 now', 'youtube'],
     ['reel https://www.instagram.com/reel/C123/?igsh=abc', 'instagram'],
-    ['fb https://www.facebook.com/watch/?v=123', 'facebook'],
+    ['post https://www.instagram.com/p/C123/', 'instagram'],
   ] as const)('extracts %s', (body, platform) => {
     const result = extractFirstSupportedUrl(body);
     expect(result?.platform).toBe(platform);
@@ -18,15 +17,29 @@ describe('extractFirstSupportedUrl', () => {
   });
 
   it.each([
-    ['https://youtube.com/watch?v=abc123', 'youtube'],
-    ['https://m.youtube.com/watch?v=abc123', 'youtube'],
+    ['https://youtube.com/shorts/abc123', 'youtube'],
+    ['https://www.youtube.com/shorts/abc123', 'youtube'],
+    ['https://m.youtube.com/shorts/abc123', 'youtube'],
     ['https://instagram.com/p/C123/', 'instagram'],
+    ['https://instagram.com/reel/C123/', 'instagram'],
+    ['https://www.instagram.com/p/C123/', 'instagram'],
+    ['https://www.instagram.com/reel/C123/', 'instagram'],
     ['https://m.instagram.com/reel/C123/', 'instagram'],
-    ['https://facebook.com/watch/?v=123', 'facebook'],
-    ['https://m.facebook.com/watch/?v=123', 'facebook'],
-    ['https://fb.watch/abc123/', 'facebook'],
   ] as const)('supports host in %s', (url, platform) => {
     expect(extractFirstSupportedUrl(`open ${url}`)?.platform).toBe(platform);
+  });
+
+  it.each([
+    'https://youtu.be/abc123',
+    'https://youtube.com/watch?v=abc123',
+    'https://www.youtube.com/watch?v=abc123',
+    'https://facebook.com/watch/?v=123',
+    'https://m.facebook.com/watch/?v=123',
+    'https://fb.watch/abc123/',
+    'https://instagram.com/stories/user/123',
+    'https://instagram.com/tv/C123/',
+  ])('ignores unsupported URL %s', (url) => {
+    expect(extractFirstSupportedUrl(`open ${url}`)).toBeNull();
   });
 
   it('extracts the first supported link only', () => {
@@ -41,11 +54,13 @@ describe('extractFirstSupportedUrl', () => {
   });
 
   it.each([']', '}', "'", ';', ':'] as const)('strips trailing message punctuation %s', (punctuation) => {
-    expect(extractFirstSupportedUrl(`watch https://youtu.be/abc123${punctuation}`)?.url).toBe('https://youtu.be/abc123');
+    expect(extractFirstSupportedUrl(`watch https://www.youtube.com/shorts/abc123${punctuation}`)?.url).toBe(
+      'https://www.youtube.com/shorts/abc123',
+    );
   });
 
   it('normalizes url for duplicate checks', () => {
-    expect(normalizeUrlForDuplicate('HTTPS://YOUTU.BE/abc123?utm_source=x')).toBe('https://youtu.be/abc123');
+    expect(normalizeUrlForDuplicate('HTTPS://YOUTUBE.COM/shorts/abc123?utm_source=x')).toBe('https://youtube.com/shorts/abc123');
   });
 
   it('removes tracking params, hash, and trailing slash when normalizing', () => {
@@ -55,8 +70,8 @@ describe('extractFirstSupportedUrl', () => {
   });
 
   it('sorts remaining query params when normalizing', () => {
-    expect(normalizeUrlForDuplicate('https://www.youtube.com/watch?z=last&a=first&utm_source=x')).toBe(
-      'https://www.youtube.com/watch?a=first&z=last',
+    expect(normalizeUrlForDuplicate('https://www.youtube.com/shorts/abc123?z=last&a=first&utm_source=x')).toBe(
+      'https://www.youtube.com/shorts/abc123?a=first&z=last',
     );
   });
 });

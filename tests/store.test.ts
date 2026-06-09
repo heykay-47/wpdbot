@@ -110,7 +110,7 @@ describe('createStore', () => {
     store.recordRepost({
       groupId: 'group-1@g.us',
       senderId: 'sender@c.us',
-      url: 'https://youtu.be/example',
+      url: 'https://www.youtube.com/shorts/example',
       urlHash: 'hash-a',
       createdAtMs: 1_000,
     });
@@ -131,7 +131,7 @@ describe('createStore', () => {
     store.recordSuccessfulRepost({
       groupId: 'group-1@g.us',
       senderId: 'sender@c.us',
-      url: 'https://youtu.be/example',
+      url: 'https://www.youtube.com/shorts/example',
       urlHash: 'hash-a',
       createdAtMs: 5_000,
     });

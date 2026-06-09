@@ -6,11 +6,10 @@ Date: 2026-06-08
 
 Build a Dockerized WhatsApp bot for family and small group chats. When someone posts a supported video link, the bot downloads the video, reposts it directly in the same WhatsApp group, attributes the sender and timestamp, then deletes the original link message after successful repost.
 
-Supported platforms for the first version:
+Supported link types for the first version:
 
-- YouTube
-- Instagram
-- Facebook
+- Instagram reels and posts
+- YouTube Shorts
 
 The bot uses an unofficial WhatsApp Web session through `whatsapp-web.js`, so it is intended for personal use, not a public commercial service.
 
@@ -19,7 +18,7 @@ The bot uses an unofficial WhatsApp Web session through `whatsapp-web.js`, so it
 Use one Node.js service with:
 
 - `whatsapp-web.js` for WhatsApp Web connection, message events, media sending, and message deletion.
-- `yt-dlp` CLI for video downloads from YouTube, Instagram, and Facebook.
+- `yt-dlp` CLI for video downloads from Instagram reels/posts and YouTube Shorts.
 - SQLite for persistent group settings and duplicate tracking.
 - Docker for portable deployment on local machines, student-friendly free hosting, or DigitalOcean.
 
@@ -52,7 +51,7 @@ Components:
 
 ## Message Flow
 
-1. A group member sends a YouTube, Instagram, or Facebook URL.
+1. A group member sends an Instagram reel/post or YouTube Shorts URL.
 2. Bot receives the message event.
 3. Bot ignores the message if it is not a group message, was sent by the bot, or belongs to a disabled group.
 4. Bot extracts the first supported URL from the message.
@@ -167,7 +166,7 @@ Safety rules:
 
 Automated tests:
 
-- URL extraction for YouTube, Instagram, Facebook, and unsupported links.
+- URL extraction for Instagram reels/posts, YouTube Shorts, and unsupported links.
 - Command parsing for `!bot enable`, `!bot disable`, and `!bot status`.
 - Permission decisions for group admins, bot owner, and normal members.
 - Duplicate policy decisions.
@@ -181,7 +180,7 @@ Manual smoke test:
 - Add bot account and make it admin.
 - Scan QR and confirm persistent session survives container restart.
 - Enable bot in test group.
-- Send one supported YouTube link, one Instagram link, and one Facebook link.
+- Send one YouTube Shorts link, one Instagram reel link, and one Instagram post link.
 - Confirm video repost, caption, original message deletion, duplicate handling, and failure message for oversized video.
 
 ## Out Of Scope For Version One
@@ -191,13 +190,13 @@ Manual smoke test:
 - Public SaaS usage.
 - Web dashboard.
 - Queue-based multi-worker download architecture.
-- Generic video link support outside YouTube, Instagram, and Facebook.
+- Generic video link support outside Instagram reels/posts and YouTube Shorts.
 - Chat commands for changing every per-group setting.
 
 ## Open Risks
 
 - WhatsApp may change Web internals and break unofficial clients.
 - WhatsApp account may face restrictions if behavior looks automated or spammy.
-- `yt-dlp` support for Instagram/Facebook may require cookies for some private, age-gated, or region-limited content.
+- `yt-dlp` support for Instagram may require cookies for some private, age-gated, or region-limited content.
 - Large uploads may be slow or fail on free hosting or low-memory machines.
 - Deleting someone else's group message depends on WhatsApp admin capabilities exposed through Web behavior.

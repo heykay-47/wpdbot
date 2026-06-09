@@ -74,7 +74,7 @@ describe('formatStatus', () => {
     const status = formatStatus({ enabled: true, maxFileSizeMb: 64, duplicateWindowHours: 24, botIsAdmin: true });
 
     expect(status).toBe(
-      'Bot status: enabled\nMax size: 64 MB\nDuplicate window: 24 hours\nSupported: YouTube, Instagram, Facebook\nBot admin: yes',
+      'Bot status: enabled\nMax size: 64 MB\nDuplicate window: 24 hours\nSupported: Instagram reels/posts, YouTube Shorts\nBot admin: yes',
     );
   });
 });
@@ -143,7 +143,7 @@ describe('createWhatsappBot', () => {
     await clients[0].handlers.get('message')?.(message);
 
     expect(message.reply).toHaveBeenCalledWith(
-      'Bot status: disabled\nMax size: 64 MB\nDuplicate window: 24 hours\nSupported: YouTube, Instagram, Facebook\nBot admin: yes',
+      'Bot status: disabled\nMax size: 64 MB\nDuplicate window: 24 hours\nSupported: Instagram reels/posts, YouTube Shorts\nBot admin: yes',
     );
   });
 
@@ -162,7 +162,7 @@ describe('createWhatsappBot', () => {
     await clients[0].handlers.get('message')?.(message);
 
     expect(message.reply).toHaveBeenCalledWith(
-      'Bot status: disabled\nMax size: 64 MB\nDuplicate window: 24 hours\nSupported: YouTube, Instagram, Facebook\nBot admin: yes',
+      'Bot status: disabled\nMax size: 64 MB\nDuplicate window: 24 hours\nSupported: Instagram reels/posts, YouTube Shorts\nBot admin: yes',
     );
   });
 
@@ -183,7 +183,7 @@ describe('createWhatsappBot', () => {
     await clients[0].handlers.get('message')?.(message);
 
     expect(message.reply).toHaveBeenCalledWith(
-      'Bot status: disabled\nMax size: 64 MB\nDuplicate window: 24 hours\nSupported: YouTube, Instagram, Facebook\nBot admin: yes',
+      'Bot status: disabled\nMax size: 64 MB\nDuplicate window: 24 hours\nSupported: Instagram reels/posts, YouTube Shorts\nBot admin: yes',
     );
   });
 
@@ -218,6 +218,21 @@ describe('createWhatsappBot', () => {
     expect(message.reply).not.toHaveBeenCalled();
     expect(store.getGroupSettings).not.toHaveBeenCalled();
     expect(store.setGroupEnabled).not.toHaveBeenCalled();
+  });
+
+  test('relays supported link from WhatsApp links field when body is empty', async () => {
+    const store = fakeStore();
+    store.getGroupSettings.mockReturnValue({ groupId: 'group-1@g.us', enabled: true, maxFileSizeMb: 64, duplicateWindowHours: 24 });
+    const downloader = fakeDownloader();
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: baseConfig(), store, downloader });
+    const message = fakeMessage('', {
+      links: [{ link: 'https://www.instagram.com/reel/DWJbfWGDBQg/', isSuspicious: false }],
+    });
+
+    await clients[0].handlers.get('message')?.(message);
+
+    expect(downloader.download).toHaveBeenCalledWith('https://www.instagram.com/reel/DWJbfWGDBQg/', 64);
   });
 
   test('relayWhatsapp sends video, text, and deletes messages for everyone', async () => {
@@ -341,6 +356,7 @@ function fakeMessage(
     author?: string;
     contact?: Record<string, unknown>;
     participants?: Array<Record<string, unknown>>;
+    links?: Array<{ link: string; isSuspicious: boolean }>;
   } = {},
 ) {
   const botIsAdmin = options.botIsAdmin ?? true;
@@ -353,6 +369,7 @@ function fakeMessage(
     from: 'group-1@g.us',
     author: options.author ?? 'admin@c.us',
     body,
+    links: options.links,
     timestamp: 1,
     fromMe: options.fromMe ?? false,
     reply: vi.fn(),

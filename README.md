@@ -1,6 +1,6 @@
 # wpdbot
 
-WhatsApp media relay bot for groups. It watches enabled WhatsApp groups for supported social video links, downloads media with `yt-dlp`, reposts video, and skips duplicate links inside configured window.
+WhatsApp media relay bot for groups. It watches enabled WhatsApp groups for Instagram reels/posts and YouTube Shorts, downloads media with `yt-dlp`, reposts video, and skips duplicate links inside configured window.
 
 ## Requirements
 
@@ -50,7 +50,7 @@ WhatsApp media relay bot for groups. It watches enabled WhatsApp groups for supp
 
 7. In group chat, send `!bot enable` from group admin or configured owner account.
 
-8. Send supported YouTube, Instagram, or Facebook link in enabled group to test relay.
+8. Send an Instagram reel/post or YouTube Shorts link in enabled group to test relay.
 
 ## Local Development
 
@@ -84,7 +84,7 @@ Bot commands:
 
 - `!bot enable` enables relay for current group. Bot must be group admin.
 - `!bot disable` disables relay for current group.
-- `!bot status` shows current group settings and bot admin status.
+- `!bot status` shows current group settings, supported link types, and bot admin status.
 
 Docker commands:
 
@@ -122,9 +122,10 @@ Do not commit `.env`, WhatsApp auth/cache, database files, or downloads. The con
 - Restart the container; confirm session persists without a new QR scan.
 - Send `!bot status`; confirm bot admin shows `yes`.
 - Send `!bot enable`; confirm enabled response.
-- Send one YouTube link; confirm repost, caption, and original deletion.
-- Send one Instagram link; confirm repost, caption, and original deletion.
-- Send one Facebook link; confirm repost, caption, and original deletion.
+- Send one YouTube Shorts link; confirm repost, caption, and original deletion.
+- Send one Instagram reel link; confirm repost, caption, and original deletion.
+- Send one Instagram post link; confirm repost, caption, and original deletion.
+- Send one Facebook link; confirm bot ignores it.
 - Send the same link again within 24 hours; confirm duplicate skip.
 - Send `!bot disable`; confirm future links are ignored.
 

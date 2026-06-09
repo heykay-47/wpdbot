@@ -40,6 +40,7 @@ type WhatsappMessage = {
   from: string;
   author?: string;
   body?: string;
+  links?: Array<{ link?: string; isSuspicious?: boolean }>;
   timestamp?: number;
   fromMe?: boolean;
   reply(text: string): Promise<unknown> | unknown;
@@ -76,7 +77,7 @@ export function formatStatus({ enabled, maxFileSizeMb, duplicateWindowHours, bot
     `Bot status: ${enabled ? 'enabled' : 'disabled'}`,
     `Max size: ${maxFileSizeMb} MB`,
     `Duplicate window: ${duplicateWindowHours} hours`,
-    'Supported: YouTube, Instagram, Facebook',
+    'Supported: Instagram reels/posts, YouTube Shorts',
     `Bot admin: ${botIsAdmin ? 'yes' : 'no'}`,
   ].join('\n');
 }
@@ -222,11 +223,19 @@ async function toIncomingMessage(message: WhatsappMessage, chat: WhatsappChat, g
     groupId,
     senderId,
     senderName: contact?.pushname ?? contact?.name ?? contact?.number ?? senderId,
-    body: message.body ?? '',
+    body: messageText(message),
     timestampMs: (message.timestamp ?? Math.floor(Date.now() / 1000)) * 1000,
     isGroup: Boolean(chat.isGroup),
     fromMe: Boolean(message.fromMe),
   };
+}
+
+function messageText(message: WhatsappMessage): string {
+  const parts = [message.body ?? ''];
+  for (const link of message.links ?? []) {
+    if (!link.isSuspicious && link.link) parts.push(link.link);
+  }
+  return parts.join(' ');
 }
 
 function chatId(chat: WhatsappChat): string | null {

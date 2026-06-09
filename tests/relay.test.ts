@@ -11,7 +11,7 @@ const baseMessage: IncomingMessage = {
   groupId: 'group-1@g.us',
   senderId: 'sender@c.us',
   senderName: 'Mom',
-  body: 'watch this https://youtu.be/Video123?utm_source=x',
+  body: 'watch this https://www.youtube.com/shorts/Video123?utm_source=x',
   timestampMs: Date.UTC(2026, 5, 8, 14, 12),
   isGroup: true,
   fromMe: false,
@@ -138,7 +138,7 @@ describe('handleIncomingMessage', () => {
     });
 
     expect(downloader.calls).toEqual([
-      { name: 'download', args: ['https://youtu.be/Video123?utm_source=x', 32] },
+      { name: 'download', args: ['https://www.youtube.com/shorts/Video123?utm_source=x', 32] },
     ]);
     expect(whatsapp.calls).toEqual([
       {
@@ -146,7 +146,7 @@ describe('handleIncomingMessage', () => {
         args: [
           'group-1@g.us',
           filePath,
-          'Sent by Mom at 08 Jun 2026, 7:42 PM IST\nOriginal: https://youtu.be/Video123?utm_source=x',
+          'Sent by Mom at 08 Jun 2026, 7:42 PM IST\nOriginal: https://www.youtube.com/shorts/Video123?utm_source=x',
         ],
       },
       { name: 'deleteMessage', args: ['message-1'] },
@@ -160,7 +160,7 @@ describe('handleIncomingMessage', () => {
     expect(store.calls.find((call) => call.name === 'recordSuccessfulRepost')?.args[0]).toMatchObject({
       groupId: 'group-1@g.us',
       senderId: 'sender@c.us',
-      url: 'https://youtu.be/Video123?utm_source=x',
+      url: 'https://www.youtube.com/shorts/Video123?utm_source=x',
       createdAtMs: nowMs,
     });
     expect(cleanupCalls).toEqual([filePath]);

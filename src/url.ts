@@ -6,14 +6,9 @@ const PLATFORM_HOSTS = new Map<string, SupportedPlatform>([
   ['youtube.com', 'youtube'],
   ['www.youtube.com', 'youtube'],
   ['m.youtube.com', 'youtube'],
-  ['youtu.be', 'youtube'],
   ['instagram.com', 'instagram'],
   ['www.instagram.com', 'instagram'],
   ['m.instagram.com', 'instagram'],
-  ['facebook.com', 'facebook'],
-  ['www.facebook.com', 'facebook'],
-  ['m.facebook.com', 'facebook'],
-  ['fb.watch', 'facebook'],
 ]);
 
 const TRACKING_PARAMS = new Set(['fbclid', 'igsh']);
@@ -21,7 +16,14 @@ const TRACKING_PARAMS = new Set(['fbclid', 'igsh']);
 function platformForUrl(value: string): SupportedPlatform | null {
   try {
     const url = new URL(value);
-    return PLATFORM_HOSTS.get(url.hostname.toLowerCase()) ?? null;
+    const platform = PLATFORM_HOSTS.get(url.hostname.toLowerCase());
+    if (!platform) return null;
+
+    const path = url.pathname.toLowerCase();
+    if (platform === 'youtube') return path.startsWith('/shorts/') ? 'youtube' : null;
+    if (platform === 'instagram') return path.startsWith('/reel/') || path.startsWith('/p/') ? 'instagram' : null;
+
+    return null;
   } catch {
     return null;
   }

@@ -33,7 +33,7 @@ describe('createDownloader', () => {
       return { stdout: `intermediate output\n${filePath}\n` };
     };
 
-    const result = await createDownloader({ downloadDir, runner }).download('https://youtu.be/example', 1);
+    const result = await createDownloader({ downloadDir, runner }).download('https://www.youtube.com/shorts/example', 1);
 
     expect(result).toEqual({ filePath, sizeBytes: 1024 });
     expect(calls).toEqual([
@@ -51,7 +51,7 @@ describe('createDownloader', () => {
           join(dirname(filePath), '%(title)s.%(ext)s'),
           '--print',
           'after_move:filepath',
-          'https://youtu.be/example',
+          'https://www.youtube.com/shorts/example',
         ],
       ],
     ]);
@@ -72,8 +72,8 @@ describe('createDownloader', () => {
     };
     const downloader = createDownloader({ downloadDir, runner });
 
-    await downloader.download('https://youtu.be/one', 1);
-    await downloader.download('https://youtu.be/two', 1);
+    await downloader.download('https://www.youtube.com/shorts/one', 1);
+    await downloader.download('https://www.youtube.com/shorts/two', 1);
 
     expect(outputDirs).toHaveLength(2);
     expect(outputDirs[0]).not.toBe(outputDirs[1]);
@@ -94,7 +94,7 @@ describe('createDownloader', () => {
       return { stdout: `${filePath}\n` };
     };
 
-    await expect(createDownloader({ downloadDir, runner }).download('https://youtu.be/example', 1)).rejects.toThrow(
+    await expect(createDownloader({ downloadDir, runner }).download('https://www.youtube.com/shorts/example', 1)).rejects.toThrow(
       'Downloaded file exceeds 1 MB',
     );
     expect(existsSync(filePath)).toBe(false);
@@ -111,26 +111,8 @@ describe('createDownloader', () => {
       throw new Error('yt-dlp failed');
     };
 
-    await expect(createDownloader({ downloadDir, runner }).download('https://youtu.be/example', 1)).rejects.toThrow(
+    await expect(createDownloader({ downloadDir, runner }).download('https://www.youtube.com/shorts/example', 1)).rejects.toThrow(
       'yt-dlp failed',
-    );
-    expect(existsSync(downloadSubdir)).toBe(false);
-  });
-
-  it('sanitizes Facebook extractor parse failures', async () => {
-    const downloadDir = join(createTempDir(), 'downloads');
-    let downloadSubdir = '';
-    const runner: DownloaderRunner = async (_file, args) => {
-      const outputTemplate = args[args.indexOf('--output') + 1];
-      downloadSubdir = dirname(outputTemplate);
-      mkdirSync(downloadSubdir, { recursive: true });
-      throw new Error(
-        "Command failed with exit code 1: yt-dlp --no-playlist 'https://www.facebook.com/share/p/1EDU8P8DV4/'\n\nERROR: [facebook] 1523901521039742: Cannot parse data; please report this issue",
-      );
-    };
-
-    await expect(createDownloader({ downloadDir, runner }).download('https://www.facebook.com/share/p/1EDU8P8DV4/', 64)).rejects.toThrow(
-      'Facebook post could not be downloaded. It may not contain a public video, or Facebook changed the page format.',
     );
     expect(existsSync(downloadSubdir)).toBe(false);
   });
@@ -145,7 +127,7 @@ describe('createDownloader', () => {
       return { stdout: '\n' };
     };
 
-    await expect(createDownloader({ downloadDir, runner }).download('https://youtu.be/example', 1)).rejects.toThrow(
+    await expect(createDownloader({ downloadDir, runner }).download('https://www.youtube.com/shorts/example', 1)).rejects.toThrow(
       'yt-dlp did not print downloaded file path',
     );
     expect(existsSync(downloadSubdir)).toBe(false);
@@ -161,7 +143,7 @@ describe('createDownloader', () => {
       return { stdout: `${join(downloadSubdir, 'missing.mp4')}\n` };
     };
 
-    await expect(createDownloader({ downloadDir, runner }).download('https://youtu.be/example', 1)).rejects.toThrow();
+    await expect(createDownloader({ downloadDir, runner }).download('https://www.youtube.com/shorts/example', 1)).rejects.toThrow();
     expect(existsSync(downloadSubdir)).toBe(false);
   });
 });

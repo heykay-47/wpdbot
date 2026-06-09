@@ -48,19 +48,8 @@ export function createDownloader({ downloadDir, runner = defaultRunner }: Downlo
         return { filePath, sizeBytes: size };
       } catch (error) {
         await rm(tempDir, { force: true, recursive: true }).catch(() => undefined);
-        throw normalizeDownloaderError(error, url);
+        throw error;
       }
     },
   };
-}
-
-function normalizeDownloaderError(error: unknown, url: string): Error {
-  const message = error instanceof Error ? error.message : String(error);
-  const isFacebookUrl = /https?:\/\/(?:www\.|m\.)?facebook\.com|https?:\/\/fb\.watch/i.test(url);
-
-  if (isFacebookUrl && message.includes('Cannot parse data')) {
-    return new Error('Facebook post could not be downloaded. It may not contain a public video, or Facebook changed the page format.');
-  }
-
-  return error instanceof Error ? error : new Error(message);
 }
