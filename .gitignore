@@ -6,3 +6,4 @@ dist/
 *.db-wal
 .wwebjs_auth/
 .wwebjs_cache/
+docs/
