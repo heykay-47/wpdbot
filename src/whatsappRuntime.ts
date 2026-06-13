@@ -13,8 +13,10 @@ export type WhatsappRuntimePathInput = Partial<WhatsappRuntimePaths>;
 const chromiumLockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'] as const;
 
 export function resolveWhatsappRuntimePaths(paths: WhatsappRuntimePathInput = {}): WhatsappRuntimePaths {
-  const authDir = paths.authDir ?? '/app/.wwebjs_auth';
-  const cacheDir = paths.cacheDir ?? '/app/.wwebjs_cache';
+  const authEnv = process.env.WHATSAPP_AUTH_DIR?.trim();
+  const cacheEnv = process.env.WHATSAPP_CACHE_DIR?.trim();
+  const authDir = paths.authDir ?? (authEnv || '.wwebjs_auth');
+  const cacheDir = paths.cacheDir ?? (cacheEnv || '.wwebjs_cache');
 
   return {
     authDir,

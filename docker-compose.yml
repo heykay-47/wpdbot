@@ -6,6 +6,8 @@ services:
     environment:
       SQLITE_PATH: /data/bot.db
       DOWNLOAD_DIR: /tmp/wpdbot-downloads
+      WHATSAPP_AUTH_DIR: /app/.wwebjs_auth
+      WHATSAPP_CACHE_DIR: /app/.wwebjs_cache
     restart: unless-stopped
     volumes:
       - wpdbot-auth:/app/.wwebjs_auth

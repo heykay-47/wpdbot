@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { prepareWhatsappRuntime, resolveWhatsappRuntimePaths } from '../src/whatsappRuntime';
 
 const tempDirs: string[] = [];
+const originalWhatsappAuthDir = process.env.WHATSAPP_AUTH_DIR;
+const originalWhatsappCacheDir = process.env.WHATSAPP_CACHE_DIR;
 
 function tempRoot(): string {
   const root = mkdtempSync(join(tmpdir(), 'wpdbot-runtime-'));
@@ -15,10 +17,59 @@ function tempRoot(): string {
 afterEach(() => {
   for (const dir of tempDirs) rmSync(dir, { force: true, recursive: true });
   tempDirs.length = 0;
+  restoreEnv('WHATSAPP_AUTH_DIR', originalWhatsappAuthDir);
+  restoreEnv('WHATSAPP_CACHE_DIR', originalWhatsappCacheDir);
   vi.restoreAllMocks();
 });
 
+function restoreEnv(name: 'WHATSAPP_AUTH_DIR' | 'WHATSAPP_CACHE_DIR', value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
 describe('resolveWhatsappRuntimePaths', () => {
+  it('defaults to local whatsapp auth and cache directories', () => {
+    delete process.env.WHATSAPP_AUTH_DIR;
+    delete process.env.WHATSAPP_CACHE_DIR;
+
+    const paths = resolveWhatsappRuntimePaths();
+
+    expect(paths).toEqual({
+      authDir: '.wwebjs_auth',
+      cacheDir: '.wwebjs_cache',
+      chromeProfileDir: '.wwebjs_auth/session',
+      chromeCacheDir: '.wwebjs_cache/chrome-cache',
+    });
+  });
+
+  it('uses whatsapp runtime directory environment variables for defaults', () => {
+    process.env.WHATSAPP_AUTH_DIR = '/app/.wwebjs_auth';
+    process.env.WHATSAPP_CACHE_DIR = '/app/.wwebjs_cache';
+
+    const paths = resolveWhatsappRuntimePaths();
+
+    expect(paths).toEqual({
+      authDir: '/app/.wwebjs_auth',
+      cacheDir: '/app/.wwebjs_cache',
+      chromeProfileDir: '/app/.wwebjs_auth/session',
+      chromeCacheDir: '/app/.wwebjs_cache/chrome-cache',
+    });
+  });
+
+  it('uses explicit auth and cache directories before environment variables', () => {
+    process.env.WHATSAPP_AUTH_DIR = '/app/.wwebjs_auth';
+    process.env.WHATSAPP_CACHE_DIR = '/app/.wwebjs_cache';
+
+    const paths = resolveWhatsappRuntimePaths({ authDir: '/explicit-auth', cacheDir: '/explicit-cache' });
+
+    expect(paths).toEqual({
+      authDir: '/explicit-auth',
+      cacheDir: '/explicit-cache',
+      chromeProfileDir: '/explicit-auth/session',
+      chromeCacheDir: '/explicit-cache/chrome-cache',
+    });
+  });
+
   it('derives Chrome profile and cache paths from auth and cache roots', () => {
     const paths = resolveWhatsappRuntimePaths({ authDir: '/auth', cacheDir: '/cache' });
 

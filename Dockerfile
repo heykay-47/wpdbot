@@ -20,7 +20,9 @@ ENV NODE_ENV=production \
     PUPPETEER_SKIP_DOWNLOAD=true \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable \
     SQLITE_PATH=/data/bot.db \
-    DOWNLOAD_DIR=/tmp/wpdbot-downloads
+    DOWNLOAD_DIR=/tmp/wpdbot-downloads \
+    WHATSAPP_AUTH_DIR=/app/.wwebjs_auth \
+    WHATSAPP_CACHE_DIR=/app/.wwebjs_cache
 
 WORKDIR /app
 
