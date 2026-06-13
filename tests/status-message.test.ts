@@ -1,16 +1,37 @@
-import { beforeEach, describe, expect, test, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 const execaMock = vi.hoisted(() => vi.fn(async () => ({ stdout: '' })));
 
 const clients: MockClient[] = [];
 const mediaPaths: string[] = [];
 const deletedMessages: Array<{ delete: ReturnType<typeof vi.fn> }> = [];
+const tempDirs: string[] = [];
+
+function runtimePaths() {
+  const root = mkdtempSync(join(tmpdir(), 'wpdbot-whatsapp-test-'));
+  tempDirs.push(root);
+
+  return {
+    authDir: join(root, 'auth'),
+    cacheDir: join(root, 'cache'),
+  };
+}
+
+afterEach(() => {
+  for (const dir of tempDirs) rmSync(dir, { force: true, recursive: true });
+  tempDirs.length = 0;
+});
 
 class MockLocalAuth {
   clientId?: string;
+  dataPath?: string;
 
-  constructor(options: { clientId?: string } = {}) {
+  constructor(options: { clientId?: string; dataPath?: string } = {}) {
     this.clientId = options.clientId;
+    this.dataPath = options.dataPath;
   }
 }
 
@@ -97,18 +118,28 @@ describe('createWhatsappBot', () => {
     vi.clearAllMocks();
   });
 
-  test('creates client with LocalAuth and no-sandbox puppeteer args', async () => {
+  test('creates client with LocalAuth, explicit runtime paths, and prepares before initialize', async () => {
     const { createWhatsappBot } = await import('../src/whatsapp');
+    const paths = runtimePaths();
 
-    const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
+    const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader(), runtimePaths: paths });
 
     expect(clients).toHaveLength(1);
     expect(clients[0].options).toMatchObject({
-      puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] },
+      puppeteer: {
+        args: expect.arrayContaining([
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          `--disk-cache-dir=${join(paths.cacheDir, 'chrome-cache')}`,
+        ]),
+      },
     });
     expect((clients[0].options as { authStrategy: MockLocalAuth }).authStrategy).toBeInstanceOf(MockLocalAuth);
+    expect((clients[0].options as { authStrategy: MockLocalAuth }).authStrategy.dataPath).toBe(paths.authDir);
+
     bot.start();
-    expect(clients[0].initialize).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(clients[0].initialize).toHaveBeenCalledOnce());
   });
 
   test('enables group only when requester and bot are admins', async () => {

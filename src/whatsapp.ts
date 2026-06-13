@@ -7,6 +7,7 @@ import { canManageGroup, parseCommand } from './commands.js';
 import { handleIncomingMessage, type IncomingMessage, type RelayDownloader } from './relay.js';
 import type { AppConfig } from './config.js';
 import type { Store } from './store.js';
+import { prepareWhatsappRuntime, resolveWhatsappRuntimePaths, type WhatsappRuntimePathInput } from './whatsappRuntime.js';
 
 const { Client, LocalAuth, MessageMedia } = whatsappWeb;
 
@@ -33,6 +34,7 @@ type CreateWhatsappBotInput = {
   config: AppConfig;
   store: Store;
   downloader: RelayDownloader;
+  runtimePaths?: WhatsappRuntimePathInput;
 };
 
 type WhatsappMessage = {
@@ -82,10 +84,20 @@ export function formatStatus({ enabled, maxFileSizeMb, duplicateWindowHours, bot
   ].join('\n');
 }
 
-export function createWhatsappBot({ config, store, downloader }: CreateWhatsappBotInput): WhatsappBot {
+export function createWhatsappBot({ config, store, downloader, runtimePaths: runtimePathInput }: CreateWhatsappBotInput): WhatsappBot {
+  const runtimePaths = resolveWhatsappRuntimePaths(runtimePathInput);
+  const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH?.trim() || undefined;
   const client = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] },
+    authStrategy: new LocalAuth({ dataPath: runtimePaths.authDir }),
+    puppeteer: {
+      executablePath,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        `--disk-cache-dir=${runtimePaths.chromeCacheDir}`,
+      ],
+    },
   });
 
   const relayWhatsapp: WhatsappRelay = {
@@ -140,7 +152,11 @@ export function createWhatsappBot({ config, store, downloader }: CreateWhatsappB
     client,
     relayWhatsapp,
     start() {
-      client.initialize();
+      void prepareWhatsappRuntime(runtimePaths)
+        .then(() => client.initialize())
+        .catch((error: unknown) => {
+          console.error('Failed to prepare WhatsApp runtime', error);
+        });
     },
   };
 }
