@@ -124,10 +124,13 @@ Only do this when restart does not recover the session. This removes the saved W
 
 ```sh
 docker compose down
-docker volume rm wpdbot_wpdbot-auth wpdbot_wpdbot-cache
+docker volume ls
+docker volume rm <compose-project>_wpdbot-auth <compose-project>_wpdbot-cache
 docker compose up -d
 docker compose logs -f
 ```
+
+Replace `<compose-project>` with the prefix shown by `docker volume ls`; it is often the clone directory name or `COMPOSE_PROJECT_NAME`.
 
 Keep the `wpdbot-data` volume unless you also want to erase group settings and repost history.
 
