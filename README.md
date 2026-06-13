@@ -94,6 +94,43 @@ Docker commands:
 - `docker compose down` stops bot without deleting persisted data.
 - `docker compose build --no-cache` rebuilds image from scratch.
 
+## Troubleshooting
+
+### Refresh `yt-dlp` and Chrome dependencies
+
+If YouTube Shorts fail with an `n challenge solving failed` warning or `Requested format is not available`, rebuild the image so Docker installs the current `yt-dlp[default]` package and challenge solver scripts:
+
+```sh
+docker compose build --no-cache
+docker compose up -d
+docker compose logs -f
+```
+
+Some YouTube or Instagram links may still fail when the upstream site requires cookies, blocks the server region, or changes extraction behavior before `yt-dlp` supports it.
+
+### Recover from Chrome profile locks
+
+The bot removes stale Chromium `SingletonLock`, `SingletonSocket`, and `SingletonCookie` files at startup. If Chrome still reports that the profile is in use, restart cleanly:
+
+```sh
+docker compose down
+docker compose up -d
+docker compose logs -f
+```
+
+### Reset a corrupt WhatsApp session
+
+Only do this when restart does not recover the session. This removes the saved WhatsApp login and browser cache, so you must scan the QR code again:
+
+```sh
+docker compose down
+docker volume rm wpdbot_wpdbot-auth wpdbot_wpdbot-cache
+docker compose up -d
+docker compose logs -f
+```
+
+Keep the `wpdbot-data` volume unless you also want to erase group settings and repost history.
+
 ## Persistent Data
 
 Compose mounts these Docker volumes into container:
