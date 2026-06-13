@@ -41,8 +41,11 @@ RUN groupadd --system --gid 10001 wpdbot \
     && apt-get update \
     && apt-get install -y --no-install-recommends google-chrome-stable \
     && python3 -m venv /opt/yt-dlp \
-    && /opt/yt-dlp/bin/pip install --no-cache-dir yt-dlp \
+    && /opt/yt-dlp/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/yt-dlp/bin/pip install --no-cache-dir "yt-dlp[default]" \
     && ln -s /opt/yt-dlp/bin/yt-dlp /usr/local/bin/yt-dlp \
+    && mkdir -p /etc/yt-dlp \
+    && printf '%s\n' '--js-runtimes node:/usr/local/bin/node' > /etc/yt-dlp.conf \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /app /data /tmp/wpdbot-downloads /app/.wwebjs_auth /app/.wwebjs_cache \
