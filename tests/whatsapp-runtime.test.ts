@@ -46,6 +46,7 @@ describe('prepareWhatsappRuntime', () => {
     writeFileSync(join(paths.chromeProfileDir, 'SingletonSocket'), 'socket');
     writeFileSync(join(paths.chromeProfileDir, 'SingletonCookie'), 'cookie');
     writeFileSync(join(paths.chromeProfileDir, 'Default'), 'profile-data');
+    writeFileSync(join(paths.chromeCacheDir, 'SingletonLock'), 'cache-lock');
     writeFileSync(join(paths.chromeCacheDir, 'CacheData'), 'cache-data');
 
     await prepareWhatsappRuntime(paths);
@@ -58,6 +59,7 @@ describe('prepareWhatsappRuntime', () => {
     expect(existsSync(join(paths.chromeProfileDir, 'SingletonSocket'))).toBe(false);
     expect(existsSync(join(paths.chromeProfileDir, 'SingletonCookie'))).toBe(false);
     expect(existsSync(join(paths.chromeProfileDir, 'Default'))).toBe(true);
+    expect(existsSync(join(paths.chromeCacheDir, 'SingletonLock'))).toBe(false);
     expect(existsSync(join(paths.chromeCacheDir, 'CacheData'))).toBe(true);
   });
 
