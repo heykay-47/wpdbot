@@ -18,7 +18,7 @@ FROM node:20-slim AS runtime
 
 ENV NODE_ENV=production \
     PUPPETEER_SKIP_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable \
     SQLITE_PATH=/data/bot.db \
     DOWNLOAD_DIR=/tmp/wpdbot-downloads
 
@@ -28,13 +28,18 @@ RUN groupadd --system --gid 10001 wpdbot \
     && useradd --system --uid 10001 --gid wpdbot --home-dir /app --shell /usr/sbin/nologin wpdbot \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-      chromium \
       ffmpeg \
       python3 \
       python3-pip \
       python3-venv \
       ca-certificates \
+      curl \
+      gnupg \
       fonts-liberation \
+    && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-linux-signing-keyring.gpg \
+    && printf 'deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-signing-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main\n' > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends google-chrome-stable \
     && python3 -m venv /opt/yt-dlp \
     && /opt/yt-dlp/bin/pip install --no-cache-dir yt-dlp \
     && ln -s /opt/yt-dlp/bin/yt-dlp /usr/local/bin/yt-dlp \
