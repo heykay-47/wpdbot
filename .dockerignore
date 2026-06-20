@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.wwebjs_auth/
+.wwebjs_cache/
+data/
+downloads/
+.worktrees/
+.git/
+.gitignore
+*.db
+*.db-shm
+*.db-wal
+npm-debug.log*

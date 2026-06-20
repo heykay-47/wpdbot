@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+*.db
+*.db-shm
+*.db-wal
+.wwebjs_auth/
+.wwebjs_cache/
+docs/
+.worktrees/

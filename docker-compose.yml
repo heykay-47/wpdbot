@@ -1,0 +1,29 @@
+services:
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    restart: unless-stopped
+
+  wpdbot:
+    build: .
+    env_file:
+      - .env
+    environment:
+      SQLITE_PATH: /data/bot.db
+      DOWNLOAD_DIR: /tmp/wpdbot-downloads
+      WHATSAPP_AUTH_DIR: /app/.wwebjs_auth
+      WHATSAPP_CACHE_DIR: /app/.wwebjs_cache
+    restart: unless-stopped
+    depends_on:
+      - bgutil-provider
+    volumes:
+      - wpdbot-auth:/app/.wwebjs_auth
+      - wpdbot-cache:/app/.wwebjs_cache
+      - wpdbot-data:/data
+      - wpdbot-downloads:/tmp/wpdbot-downloads
+      - /root/wpdbot/youtube-cookies.txt:/cookies/youtube-cookies.txt
+
+volumes:
+  wpdbot-auth:
+  wpdbot-cache:
+  wpdbot-data:
+  wpdbot-downloads:

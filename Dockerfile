@@ -1,0 +1,69 @@
+FROM node:20-slim AS build
+
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY tsconfig.json vitest.config.ts ./
+COPY src ./src
+COPY tests ./tests
+
+RUN npm test
+RUN npm run build
+
+FROM node:20-slim AS runtime
+
+ENV NODE_ENV=production \
+    PUPPETEER_SKIP_DOWNLOAD=true \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable \
+    SQLITE_PATH=/data/bot.db \
+    DOWNLOAD_DIR=/tmp/wpdbot-downloads \
+    WHATSAPP_AUTH_DIR=/app/.wwebjs_auth \
+    WHATSAPP_CACHE_DIR=/app/.wwebjs_cache
+
+WORKDIR /app
+
+RUN groupadd --system --gid 10001 wpdbot \
+    && useradd --system --uid 10001 --gid wpdbot --home-dir /app --shell /usr/sbin/nologin wpdbot \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+      ffmpeg \
+      python3 \
+      python3-pip \
+      python3-venv \
+      ca-certificates \
+      curl \
+      gnupg \
+      fonts-liberation \
+      unzip \
+    && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-linux-signing-keyring.gpg \
+    && printf 'deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-signing-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main\n' > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends google-chrome-stable \
+    && python3 -m venv /opt/yt-dlp \
+    && /opt/yt-dlp/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/yt-dlp/bin/pip install --no-cache-dir "yt-dlp[default]" bgutil-ytdlp-pot-provider \
+    && ln -s /opt/yt-dlp/bin/yt-dlp /usr/local/bin/yt-dlp \
+    && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/opt/deno sh \
+    && ln -s /opt/deno/bin/deno /usr/local/bin/deno \
+    && printf '%s\n' \
+         '--extractor-args youtubepot-bgutilhttp:base_url=http://bgutil-provider:4416' \
+         > /etc/yt-dlp.conf \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /app /data /tmp/wpdbot-downloads /app/.wwebjs_auth /app/.wwebjs_cache \
+    && chown -R wpdbot:wpdbot /app /data /tmp/wpdbot-downloads
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+COPY --from=build /app/dist ./dist
+
+RUN chown -R wpdbot:wpdbot /app
+
+USER wpdbot
+
+CMD ["npm", "start"]
