@@ -4,8 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { KeyedTaskQueue } from '../src/keyedTaskQueue';
-import { handleIncomingMessage, type IncomingMessage, type RelayDownloader, type RelayWhatsapp } from '../src/relay';
-import type { Store } from '../src/store';
+import { handleIncomingMessage, type HandleIncomingMessageInput, type IncomingMessage, type RelayDownloader, type RelayWhatsapp } from '../src/relay';
 
 const baseMessage: IncomingMessage = {
   id: 'message-1',
@@ -20,7 +19,9 @@ const baseMessage: IncomingMessage = {
 
 type StoreCall = { name: string; args: unknown[] };
 
-function createStore(overrides: Partial<Store> = {}): Store & { calls: StoreCall[] } {
+type RelayStore = HandleIncomingMessageInput['store'];
+
+function createStore(overrides: Partial<RelayStore> = {}): RelayStore & { calls: StoreCall[] } {
   const calls: StoreCall[] = [];
   return {
     calls,
@@ -28,42 +29,12 @@ function createStore(overrides: Partial<Store> = {}): Store & { calls: StoreCall
       calls.push({ name: 'getGroupSettings', args: [groupId] });
       return { groupId, enabled: true, maxFileSizeMb: 32, duplicateWindowHours: 6 };
     },
-    setGroupEnabled(groupId, enabled) {
-      calls.push({ name: 'setGroupEnabled', args: [groupId, enabled] });
-    },
-    recordDuplicate(groupId, urlHash, createdAtMs) {
-      calls.push({ name: 'recordDuplicate', args: [groupId, urlHash, createdAtMs] });
-    },
     wasRecentlyPosted(groupId, urlHash, nowMs, windowHours) {
       calls.push({ name: 'wasRecentlyPosted', args: [groupId, urlHash, nowMs, windowHours] });
       return false;
     },
-    setGroupMetadata(groupId, name, updatedAtMs) {
-      calls.push({ name: 'setGroupMetadata', args: [groupId, name, updatedAtMs] });
-    },
-    getGroupMetadata(groupId) {
-      calls.push({ name: 'getGroupMetadata', args: [groupId] });
-      return null;
-    },
-    setBotOwnerId(ownerId) {
-      calls.push({ name: 'setBotOwnerId', args: [ownerId] });
-    },
-    getBotOwnerId() {
-      calls.push({ name: 'getBotOwnerId', args: [] });
-      return null;
-    },
-    recordRepost(record) {
-      calls.push({ name: 'recordRepost', args: [record] });
-    },
     recordSuccessfulRepost(record) {
       calls.push({ name: 'recordSuccessfulRepost', args: [record] });
-    },
-    countReposts() {
-      calls.push({ name: 'countReposts', args: [] });
-      return 0;
-    },
-    close() {
-      calls.push({ name: 'close', args: [] });
     },
     ...overrides,
   };
@@ -299,15 +270,12 @@ describe('handleIncomingMessage', () => {
     const whatsapp = createWhatsapp();
     const downloader = createDownloader();
     const queue = {
-      activeCount() {
-        return 0;
-      },
       async run<T>(_key: string, task: () => Promise<T>): Promise<T> {
         postedDuringQueueWait = true;
         await Promise.resolve();
         return task();
       },
-    } as unknown as KeyedTaskQueue;
+    };
 
     await handleIncomingMessage({ message: baseMessage, store, whatsapp, downloader, timezone: 'Asia/Kolkata', queue });
 
@@ -534,15 +502,20 @@ describe('handleIncomingMessage', () => {
     expect(whatsapp.calls).toHaveLength(0);
   });
 
-  it('tracker cleans tempDir only when it is a bot-created download subdir under downloadDir', async () => {
+  it.each([false, true])('cleans owned tempDir after relay with upload failure=%s', async (uploadFails) => {
     const downloadRoot = await mkdtemp(join(tmpdir(), 'wpdbot-downloads-'));
     tempRoots.push(downloadRoot);
     const validTempDir = join(downloadRoot, 'download-xyz');
     mkdirSync(validTempDir, { recursive: true });
     const filePath = join(validTempDir, 'video.mp4');
     writeFileSync(filePath, 'video');
+    writeFileSync(join(validTempDir, 'partial.mp4'), 'partial');
     const store = createStore();
-    const whatsapp = createWhatsapp();
+    const whatsapp = createWhatsapp(uploadFails ? {
+      async sendVideo() {
+        throw new Error('upload failed');
+      },
+    } : {});
     const downloader: RelayDownloader = {
       async download() {
         return { filePath, sizeBytes: 5, tempDir: validTempDir };
@@ -553,9 +526,12 @@ describe('handleIncomingMessage', () => {
 
     expect(existsSync(validTempDir)).toBe(false);
     expect(existsSync(downloadRoot)).toBe(true);
+    if (uploadFails) {
+      expect(whatsapp.calls.at(-1)?.args[1]).toBe('Could not upload this video: Upload failed.');
+    }
   });
 
-  it('tracker does not recursively delete tempDir outside configured downloadDir', async () => {
+  it.each([false, true])('preserves untrusted tempDir with configured downloadDir=%s', async (configureDownloadDir) => {
     const untrustedRoot = await mkdtemp(join(tmpdir(), 'wpdbot-untrusted-'));
     tempRoots.push(untrustedRoot);
     const untrustedTempDir = join(untrustedRoot, 'download-xyz');
@@ -575,7 +551,14 @@ describe('handleIncomingMessage', () => {
       },
     };
 
-    await handleIncomingMessage({ message: baseMessage, store, whatsapp, downloader, timezone: 'Asia/Kolkata', downloadDir: downloadRoot });
+    await handleIncomingMessage({
+      message: baseMessage,
+      store,
+      whatsapp,
+      downloader,
+      timezone: 'Asia/Kolkata',
+      downloadDir: configureDownloadDir ? downloadRoot : undefined,
+    });
 
     expect(existsSync(filePath)).toBe(false);
     expect(existsSync(siblingFile)).toBe(true);

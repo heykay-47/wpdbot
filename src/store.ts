@@ -238,9 +238,7 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
       insertRepost.run(record.groupId, record.senderId, record.url, record.urlHash, record.createdAtMs);
     },
 
-    recordSuccessfulRepost(record) {
-      recordSuccessfulRepost(record);
-    },
+    recordSuccessfulRepost,
 
     countReposts() {
       return selectRepostCount.get()?.count ?? 0;

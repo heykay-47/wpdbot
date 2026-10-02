@@ -14,10 +14,9 @@ export class KeyedTaskQueue {
     const current = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const next = previous?.then(() => current, () => current) ?? current;
-    this.tails.set(key, next);
+    this.tails.set(key, current);
 
-    await previous?.catch(() => undefined);
+    await previous;
 
     const waitForSlot = this.acquire();
     if (waitForSlot) await waitForSlot;
@@ -27,7 +26,7 @@ export class KeyedTaskQueue {
     } finally {
       this.releaseSlot();
       release();
-      if (this.tails.get(key) === next) {
+      if (this.tails.get(key) === current) {
         this.tails.delete(key);
       }
     }

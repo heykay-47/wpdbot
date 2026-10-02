@@ -11,8 +11,9 @@ export type AppConfig = {
   concurrentDownloads: number;
 };
 
-
-function readPositiveInteger(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
+function readPositiveInteger(env: NodeJS.ProcessEnv, key: string, fallback: number): number;
+function readPositiveInteger(env: NodeJS.ProcessEnv, key: string): number | undefined;
+function readPositiveInteger(env: NodeJS.ProcessEnv, key: string, fallback?: number): number | undefined {
   const raw = env[key];
   if (raw === undefined || raw.trim() === '') return fallback;
 
@@ -30,18 +31,6 @@ function readRequired(env: NodeJS.ProcessEnv, key: string): string {
   return value;
 }
 
-function readOptionalPositiveInteger(env: NodeJS.ProcessEnv, key: string): number | undefined {
-  const raw = env[key];
-  if (raw === undefined || raw.trim() === '') return undefined;
-
-  const value = Number(raw);
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new Error(`${key} must be a positive integer`);
-  }
-
-  return value;
-}
-
 function readOptional(env: NodeJS.ProcessEnv, key: string): string | undefined {
   const value = env[key]?.trim();
   return value || undefined;
@@ -55,7 +44,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     maxFileSizeMb: readPositiveInteger(env, 'MAX_FILE_SIZE_MB', 64),
     duplicateWindowHours: readPositiveInteger(env, 'DUPLICATE_WINDOW_HOURS', 24),
     downloadDir: env.DOWNLOAD_DIR?.trim() || '/tmp/wpdbot-downloads',
-    maxDurationSeconds: readOptionalPositiveInteger(env, 'MAX_DURATION_SECONDS'),
+    maxDurationSeconds: readPositiveInteger(env, 'MAX_DURATION_SECONDS'),
     ytDlpCookiesPath: readOptional(env, 'YT_DLP_COOKIES_PATH'),
     ytDlpProxy: readOptional(env, 'YT_DLP_PROXY'),
     concurrentDownloads: readPositiveInteger(env, 'CONCURRENT_DOWNLOADS', 1),

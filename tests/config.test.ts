@@ -44,4 +44,32 @@ describe('loadConfig', () => {
     expect(config.ytDlpProxy).toBe('socks5://127.0.0.1:9050');
     expect(config.concurrentDownloads).toBe(2);
   });
+
+  it.each(['MAX_FILE_SIZE_MB', 'DUPLICATE_WINDOW_HOURS', 'CONCURRENT_DOWNLOADS', 'MAX_DURATION_SECONDS'])(
+    'rejects invalid positive integers for %s', (key) => {
+      for (const value of ['0', '-1', '1.5', 'invalid']) {
+        expect(() => loadConfig({
+          BOT_OWNER_ID: 'owner@c.us',
+          SQLITE_PATH: ':memory:',
+          [key]: value,
+        })).toThrow(`${key} must be a positive integer`);
+      }
+    },
+  );
+
+  it('treats blank numeric settings as unset', () => {
+    const config = loadConfig({
+      BOT_OWNER_ID: 'owner@c.us',
+      SQLITE_PATH: ':memory:',
+      MAX_FILE_SIZE_MB: ' ',
+      DUPLICATE_WINDOW_HOURS: '',
+      CONCURRENT_DOWNLOADS: '\t',
+      MAX_DURATION_SECONDS: ' ',
+    });
+
+    expect(config.maxFileSizeMb).toBe(64);
+    expect(config.duplicateWindowHours).toBe(24);
+    expect(config.concurrentDownloads).toBe(1);
+    expect(config.maxDurationSeconds).toBeUndefined();
+  });
 });

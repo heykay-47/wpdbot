@@ -28,8 +28,7 @@ export function resolveWhatsappRuntimePaths(paths: WhatsappRuntimePathInput = {}
 
 export async function prepareWhatsappRuntime(input: WhatsappRuntimePathInput = {}): Promise<WhatsappRuntimePaths> {
   const paths = resolveWhatsappRuntimePaths(input);
-  await Promise.all([mkdir(paths.authDir, { recursive: true }), mkdir(paths.cacheDir, { recursive: true })]);
-  await Promise.all([mkdir(paths.chromeProfileDir, { recursive: true }), mkdir(paths.chromeCacheDir, { recursive: true })]);
+  await Promise.all(Object.values(paths).map((path) => mkdir(path, { recursive: true })));
 
   const removed = await removeChromiumLocks([paths.chromeProfileDir, paths.chromeCacheDir]);
   if (removed.length > 0) console.log(`Removed stale Chromium profile locks: ${removed.join(', ')}`);

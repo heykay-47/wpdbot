@@ -106,7 +106,7 @@ export function createWhatsappBot({ config, store, downloader, queue, runtimePat
   const relayWhatsapp: WhatsappRelay = {
     async sendVideo(groupId, filePath, caption) {
       const media = MessageMedia.fromFilePath(filePath);
-      let sent: unknown;
+      let sent: Awaited<ReturnType<typeof client.sendMessage>>;
       let transcodedPath: string | null = null;
 
       try {
@@ -184,7 +184,7 @@ async function handleWhatsappMessage(
   if (!chat.isGroup) return;
   if (message.fromMe) return;
 
-  const groupId = chatId(chat) ?? message.from;
+  const groupId = serializedId(chat.id) ?? message.from;
   store.setGroupMetadata(groupId, chat.name ?? groupId, Date.now());
 
   const senderId = message.author ?? message.from;
@@ -226,7 +226,7 @@ async function handleWhatsappMessage(
   }
 
   await handleIncomingMessage({
-    message: await toIncomingMessage(message, chat, groupId, contact),
+    message: toIncomingMessage(message, chat, groupId, contact),
     store,
     whatsapp: {
       sendVideo: async (targetGroupId, filePath, caption) => {
@@ -244,7 +244,7 @@ async function handleWhatsappMessage(
   });
 }
 
-async function toIncomingMessage(message: WhatsappMessage, chat: WhatsappChat, groupId: string, contact?: WhatsappContact): Promise<IncomingMessage> {
+function toIncomingMessage(message: WhatsappMessage, chat: WhatsappChat, groupId: string, contact?: WhatsappContact): IncomingMessage {
   const senderId = message.author ?? message.from;
 
   return {
@@ -267,23 +267,19 @@ function messageText(message: WhatsappMessage): string {
   return parts.join(' ');
 }
 
-function chatId(chat: WhatsappChat): string | null {
-  return serializedId(chat.id);
-}
-
 function participantIsAdmin(participants: WhatsappParticipant[] | undefined, id: string | Set<string>): boolean {
   const targetIds = typeof id === 'string' ? idCandidates(id) : id;
   return Boolean(participants?.some((participant) => idsOverlap(participantIdCandidates(participant), targetIds) && (participant.isAdmin || participant.isSuperAdmin)));
 }
 
 function currentBotId(client: InstanceType<typeof Client>): string | null {
-  const info = (client as unknown as { info?: { wid?: { _serialized?: string; user?: string } } }).info;
+  const info = client.info;
   if (!info?.wid) return null;
   return info.wid._serialized ?? (info.wid.user ? `${info.wid.user}@c.us` : null);
 }
 
-function messageId(message: unknown): string | null {
-  return serializedId((message as { id?: { _serialized?: string } | string } | undefined)?.id);
+function messageId(message: { id?: WhatsappId } | undefined): string | null {
+  return serializedId(message?.id);
 }
 
 function serializedId(value: WhatsappId | undefined): string | null {
@@ -297,8 +293,8 @@ function idCandidates(value: WhatsappId | undefined, contact?: WhatsappContact):
   const candidates = new Set<string>();
   addIdCandidate(candidates, serializedId(value));
 
-  if (typeof value === 'object' && value) {
-    addUserServerCandidate(candidates, value.user, value.server);
+  if (typeof value === 'object' && value?.user && value.server) {
+    addIdCandidate(candidates, `${value.user}@${value.server}`);
   }
 
   addIdCandidate(candidates, serializedId(contact?.id));
@@ -320,10 +316,6 @@ function idsOverlap(left: Set<string>, right: Set<string>): boolean {
   }
 
   return false;
-}
-
-function addUserServerCandidate(candidates: Set<string>, user: string | undefined, server: string | undefined): void {
-  if (user && server) addIdCandidate(candidates, `${user}@${server}`);
 }
 
 function addIdCandidate(candidates: Set<string>, value: string | null | undefined): void {
@@ -351,33 +343,33 @@ async function transcodeForWhatsapp(filePath: string): Promise<string> {
 
   try {
     await execa('ffmpeg', [
-    '-y',
-    '-i',
-    filePath,
-    '-vf',
-    'scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2',
-    '-c:v',
-    'libx264',
-    '-preset',
-    'veryfast',
-    '-crf',
-    '28',
-    '-maxrate',
-    '1400k',
-    '-bufsize',
-    '2800k',
-    '-pix_fmt',
-    'yuv420p',
-    '-profile:v',
-    'baseline',
-    '-level',
-    '3.1',
-    '-c:a',
-    'aac',
-    '-b:a',
-    '128k',
-    '-movflags',
-    '+faststart',
+      '-y',
+      '-i',
+      filePath,
+      '-vf',
+      'scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-crf',
+      '28',
+      '-maxrate',
+      '1400k',
+      '-bufsize',
+      '2800k',
+      '-pix_fmt',
+      'yuv420p',
+      '-profile:v',
+      'baseline',
+      '-level',
+      '3.1',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '128k',
+      '-movflags',
+      '+faststart',
       outputPath,
     ]);
   } catch (error) {

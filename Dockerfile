@@ -1,4 +1,4 @@
-FROM node:20-slim AS build
+FROM node:24-slim AS build
 
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 
@@ -14,7 +14,7 @@ COPY tests ./tests
 RUN npm test
 RUN npm run build
 
-FROM node:20-slim AS runtime
+FROM node:24-slim AS runtime
 
 ENV NODE_ENV=production \
     PUPPETEER_SKIP_DOWNLOAD=true \

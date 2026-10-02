@@ -70,7 +70,6 @@ export function createDownloader({ downloadDir, runner = defaultRunner, options 
 
         const { size } = await stat(filePath);
         if (size > maxFileSizeMb * 1024 * 1024) {
-          await rm(filePath, { force: true }).catch(() => undefined);
           throw new Error(`Downloaded file exceeds ${maxFileSizeMb} MB`);
         }
 

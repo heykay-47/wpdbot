@@ -27,7 +27,7 @@ WhatsApp group media relay bot for personal use. It watches enabled WhatsApp gro
 - WhatsApp group where the bot account can be made admin.
 - `.env` file created from `.env.example`.
 
-Node 20 is the supported runtime for local development.
+Node 24 is the supported runtime for local development and Docker. Node 20 is no longer supported.
 
 ## Quick Start With Docker
 
@@ -188,6 +188,25 @@ Run checks:
 npm test
 npm run build
 ```
+
+### Dependency security
+
+`whatsapp-web.js` 1.34.7 pins Puppeteer 24.38.0, whose browser-download dependencies include the unpatched `extract-zip` package. `package.json` overrides only `@puppeteer/browsers` to 3.2.3 to remove that dependency chain while retaining Puppeteer's WhatsApp-compatible interface. The browser helper requires Node 22.12 or newer; this project uses Node 24. Keep this scoped override until WhatsApp's upstream dependency is updated and a fresh audit and browser check pass.
+
+Check both development and production dependencies:
+
+```sh
+npm audit
+npm audit --omit=dev
+```
+
+After changing browser dependencies, run the offline integration check with an installed Chrome or Chromium binary:
+
+```sh
+PUPPETEER_EXECUTABLE_PATH=/path/to/chrome npm run test:browser
+```
+
+This check launches and shuts down the real WhatsApp client browser with a temporary profile and intercepts page requests with fixture HTML. It does not contact WhatsApp, log in, or send messages. The manual smoke test below is still needed to verify live relaying.
 
 ## Troubleshooting
 
