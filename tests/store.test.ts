@@ -28,6 +28,36 @@ afterEach(() => {
 });
 
 describe('createStore', () => {
+  it('persists Instagram send reservations and confirmations across restarts without losing existing data', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wpdbot-store-'));
+    tempDirs.push(dir);
+    const path = join(dir, 'bot.sqlite');
+    const key = { groupId: 'group-1@g.us', messageId: 'source-1', postId: 'post-1', itemId: 'video-1' };
+    let store = createStore(path);
+    store.setGroupEnabled(key.groupId, true);
+    store.recordDuplicate(key.groupId, 'existing-hash', 1_000);
+
+    expect(store.beginInstagramItem(key, 2_000)).toBe(true);
+    expect(store.beginInstagramItem(key, 2_001)).toBe(false);
+    store.close();
+    store = createStore(path);
+    expect(store.getInstagramItem(key)).toEqual({ status: 'sending', sentMessageId: null, ack: null });
+    expect(store.beginInstagramItem(key, 3_000)).toBe(false);
+    store.confirmInstagramItem(key, { messageId: 'sent-1', ack: 1 }, {
+      groupId: key.groupId, senderId: 'sender@c.us', url: 'https://www.instagram.com/p/example/', urlHash: 'post-hash', createdAtMs: 3_000,
+    });
+    store.close();
+    store = createStore(path);
+    stores.push(store);
+
+    expect(store.getInstagramItem(key)).toEqual({ status: 'confirmed', sentMessageId: 'sent-1', ack: 1 });
+    expect(store.beginInstagramItem(key, 4_000)).toBe(false);
+    expect(store.countReposts()).toBe(1);
+    expect(store.getGroupSettings(key.groupId).enabled).toBe(true);
+    expect(store.wasRecentlyPosted(key.groupId, 'existing-hash', 4_000, 1)).toBe(true);
+    expect(store.wasRecentlyPosted(key.groupId, 'post-hash', 4_000, 1)).toBe(false);
+  });
+
   it('creates default group settings when missing', () => {
     const store = createTempStore();
 

@@ -7,10 +7,24 @@ WhatsApp group media relay bot for personal use. It watches enabled WhatsApp gro
 - Relays Instagram reels/posts and YouTube Shorts in WhatsApp groups.
 - Uses `whatsapp-web.js` with QR login and persisted WhatsApp Web session data.
 - Downloads media with `yt-dlp` and uses `ffmpeg` for WhatsApp-compatible retry transcodes.
-- Deletes the original link message only after the repost succeeds.
+- Attempts original-link cleanup after the existing YouTube relay succeeds; Instagram sources are retained.
 - Skips duplicate URLs per group within a configurable window.
 - Supports per-group enable/disable/status commands.
 - Runs as a Docker Compose service with persisted auth, cache, database, and download volumes.
+
+### Instagram collections
+
+- A post with several videos reposts each verifiable video in post order. Photos and entries without reliable video metadata are not reposted.
+- A source link with `img_index=3` requests only the third media item, counting photos as positions too. An invalid, unavailable, or non-video selection does not fall back to another video.
+- A failed item download does not prevent other verifiable videos from being processed. Each downloaded video must meet the configured file-size limit; configured duration checks apply to each item's available metadata.
+- Instagram source messages are always retained in this first implementation, including fully reposted single-video posts. Safe automatic cleanup awaits the remaining restart-recovery and deletion-guard work.
+- Instagram sends use one submission attempt without automatic transcode or document retries. A confirmed repost requires a sent-message ID and an observed server-or-stronger acknowledgement in the originating group. This does not prove every participant received it.
+- A send reservation is stored before submission. If the process stops, submission throws, acceptance remains uncertain, or recording confirmation fails, that item's outcome remains unresolved and the same source message will not automatically resend it. Confirmed items are also skipped if the source event is received again after restart.
+- Unresolved sends stop the collection. There is no automatic reconciliation or recovery command yet. Do not erase progress records to force a retry; review the group first because the video may already be present.
+
+SQLite initialization adds `instagram_relay_items` without changing or removing existing settings, duplicate records, or repost history. This progress is scoped to the group, source-message ID, extracted post ID, and entry ID. Existing normalized-URL duplicate windows remain in use; equivalence across different source messages or URL variants is still a separate planning task. Back up the database before updating an existing deployment.
+
+Metadata handling is conservative when yt-dlp omits entries or cannot establish their positions. Its deployed version is not pinned by this project, so fixture-based checks do not replace a separately authorized private-group smoke test.
 
 ## Important Notes
 
@@ -210,6 +224,20 @@ This check launches and shuts down the real WhatsApp client browser with a tempo
 
 ## Troubleshooting
 
+### Native SQLite crashes on Node 24.19
+
+Node 24.19.0 has an [upstream native-addon cleanup bug](https://github.com/nodejs/node/issues/65446). A SQLite addon compiled with its headers can abort with `RemoveEnvironmentCleanupHook` and `Assertion failed: (env) != nullptr` during garbage collection. Changing only the runtime does not repair an already affected binary.
+
+Rebuild the existing dependency using Node 24.18.x headers. For example, with an installed Node 24.18.0 through nvm:
+
+```sh
+nvm use 24.18.0
+npm_config_build_from_source=true npm rebuild better-sqlite3
+npm test
+```
+
+If npm gates install scripts, use its scoped `--allow-scripts=better-sqlite3` option for that rebuild. Do not enable unrelated install scripts. No SQLite database deletion or dependency-version upgrade is required. The rebuilt addon also runs on Node 24.19.0. Until the upstream fix lands, this caveat also applies to native dependencies compiled by the floating `node:24-slim` Docker base; use unaffected build headers when rebuilding an image.
+
 ### GitHub SSH Pull Fails On A Server
 
 If `git fetch origin` fails with `Permission denied (publickey)`, either configure a GitHub deploy key on the server or use the HTTPS remote for public clones:
@@ -328,7 +356,8 @@ Keep the `wpdbot-data` volume unless you also want to erase group settings and r
 - Send `!bot status` and confirm bot admin shows `yes`.
 - Send `!bot enable` and confirm enabled response.
 - Send one YouTube Shorts link, one Instagram reel link, and one Instagram post link.
-- Confirm repost, caption, original deletion, and duplicate skip behavior.
+- Confirm reposts, captions, and duplicate skips. Instagram source messages must remain visible; verify the existing YouTube cleanup separately.
+- Test an Instagram collection containing several videos and a photo, then a link selecting a video with `img_index`. Verify video order, photo omission, selected-item attribution, and source retention.
 - Send an unsupported link and confirm the bot ignores it.
 - Send `!bot disable` and confirm future links are ignored.
 

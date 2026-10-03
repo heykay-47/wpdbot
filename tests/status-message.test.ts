@@ -53,7 +53,7 @@ class MockClient {
   info = { wid: { _serialized: 'bot@c.us' } };
   handlers = new Map<string, (value?: unknown) => unknown>();
   initialize = vi.fn();
-  sendMessage = vi.fn(async (_to: string, _content: unknown, _options?: unknown) => ({ id: { _serialized: 'sent-message-id' } }));
+  sendMessage = vi.fn(async (_to: string, _content: unknown, _options?: unknown): Promise<{ id?: { _serialized: string }; ack?: number; fromMe?: boolean; to?: string }> => ({ id: { _serialized: 'sent-message-id' } }));
   getMessageById = vi.fn(async () => {
     const message = { delete: vi.fn() };
     deletedMessages.push(message);
@@ -282,6 +282,36 @@ describe('createWhatsappBot', () => {
     expect(deletedMessages[0].delete).toHaveBeenCalledWith(true);
   });
 
+  test('Instagram sends require observed server acknowledgement and never retry an ambiguous send', async () => {
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
+    clients[0].sendMessage.mockResolvedValueOnce({ id: { _serialized: 'instagram-1' }, ack: 1, fromMe: true, to: 'group-1@g.us' });
+
+    await expect(bot.relayWhatsapp.sendVideoOnce('group-1@g.us', '/tmp/video.mp4', 'caption')).resolves.toEqual({ messageId: 'instagram-1', ack: 1 });
+    expect(clients[0].sendMessage).toHaveBeenCalledWith('group-1@g.us', expect.any(MockMessageMedia), { caption: 'caption', waitUntilMsgSent: true });
+    clients[0].sendMessage.mockClear().mockRejectedValueOnce(new Error('connection lost after submission'));
+
+    await expect(bot.relayWhatsapp.sendVideoOnce('group-1@g.us', '/tmp/video.mp4', 'caption')).rejects.toThrow('connection lost');
+    expect(clients[0].sendMessage).toHaveBeenCalledOnce();
+    expect(execaMock).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    { id: { _serialized: 'pending' }, ack: 0, fromMe: true, to: 'group-1@g.us' },
+    { id: { _serialized: '' }, ack: 1, fromMe: true, to: 'group-1@g.us' },
+    { id: { _serialized: 'wrong-group' }, ack: 1, fromMe: true, to: 'other-group@g.us' },
+    { id: { _serialized: 'wrong-sender' }, ack: 1, fromMe: false, to: 'group-1@g.us' },
+  ])('does not claim Instagram confirmation without suitable ID, ACK, and group evidence: %j', async (result) => {
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
+    clients[0].sendMessage.mockResolvedValueOnce(result);
+
+    await expect(bot.relayWhatsapp.sendVideoOnce('group-1@g.us', '/tmp/video.mp4', 'caption')).rejects.toThrow('acceptance is unknown');
+
+    expect(clients[0].sendMessage).toHaveBeenCalledOnce();
+    expect(execaMock).not.toHaveBeenCalled();
+  });
+
   test('relayWhatsapp transcodes and retries inline video before document fallback', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const { createWhatsappBot } = await import('../src/whatsapp');
@@ -383,13 +413,23 @@ function fakeStore() {
     getBotOwnerId: vi.fn(() => 'owner@c.us'),
     recordRepost: vi.fn(),
     recordSuccessfulRepost: vi.fn(),
+    getInstagramItem: vi.fn(() => null),
+    beginInstagramItem: vi.fn(() => true),
+    confirmInstagramItem: vi.fn(),
     countReposts: vi.fn(() => 0),
     close: vi.fn(),
   };
 }
 
 function fakeDownloader() {
-  return { download: vi.fn(async () => ({ filePath: '/tmp/video.mp4', sizeBytes: 1 })) };
+  const download = vi.fn(async (_url: string, _maxFileSizeMb: number) => ({ filePath: '/tmp/video.mp4', sizeBytes: 1 }));
+  return {
+    download,
+    resolveInstagram: vi.fn(async (url: string) => ({
+      id: 'post-1', totalItems: 1,
+      items: [{ id: 'video-1', index: 1, kind: 'video' as const, download: async (maxFileSizeMb: number) => ({ ...await download(url, maxFileSizeMb), tempDir: '/tmp/download-test' }) }],
+    })),
+  };
 }
 
 function fakeMessage(

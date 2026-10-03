@@ -36,6 +36,10 @@ function createStore(overrides: Partial<RelayStore> = {}): RelayStore & { calls:
     recordSuccessfulRepost(record) {
       calls.push({ name: 'recordSuccessfulRepost', args: [record] });
     },
+    recordDuplicate() {},
+    getInstagramItem() { return null; },
+    beginInstagramItem() { return true; },
+    confirmInstagramItem() {},
     ...overrides,
   };
 }
@@ -47,6 +51,7 @@ function createWhatsapp(overrides: Partial<RelayWhatsapp> = {}): RelayWhatsapp &
     async sendVideo(groupId, filePath, caption) {
       calls.push({ name: 'sendVideo', args: [groupId, filePath, caption] });
     },
+    async sendVideoOnce() { return { messageId: 'sent-message', ack: 1 }; },
     async sendText(groupId, text) {
       calls.push({ name: 'sendText', args: [groupId, text] });
     },
@@ -65,6 +70,7 @@ function createDownloader(filePath = '/tmp/video.mp4', overrides: Partial<RelayD
       calls.push({ name: 'download', args: [url, maxFileSizeMb] });
       return { filePath, sizeBytes: 1000 };
     },
+    async resolveInstagram() { throw new Error('Unexpected Instagram inspection'); },
     ...overrides,
   };
 }
@@ -517,6 +523,7 @@ describe('handleIncomingMessage', () => {
       },
     } : {});
     const downloader: RelayDownloader = {
+      async resolveInstagram() { throw new Error('Unexpected Instagram inspection'); },
       async download() {
         return { filePath, sizeBytes: 5, tempDir: validTempDir };
       },
@@ -546,6 +553,7 @@ describe('handleIncomingMessage', () => {
     const store = createStore();
     const whatsapp = createWhatsapp();
     const downloader: RelayDownloader = {
+      async resolveInstagram() { throw new Error('Unexpected Instagram inspection'); },
       async download() {
         return { filePath, sizeBytes: 5, tempDir: untrustedTempDir };
       },

@@ -8,7 +8,7 @@ import { messageForError } from './errorReporter.js';
 import { KeyedTaskQueue } from './keyedTaskQueue.js';
 import { handleIncomingMessage, type IncomingMessage, type RelayDownloader } from './relay.js';
 import type { AppConfig } from './config.js';
-import type { Store } from './store.js';
+import type { RepostConfirmation, Store } from './store.js';
 import { prepareWhatsappRuntime, resolveWhatsappRuntimePaths, type WhatsappRuntimePathInput } from './whatsappRuntime.js';
 
 const { Client, LocalAuth, MessageMedia } = whatsappWeb;
@@ -22,6 +22,7 @@ export type StatusInput = {
 
 export type WhatsappRelay = {
   sendVideo(groupId: string, filePath: string, caption: string): Promise<string>;
+  sendVideoOnce(groupId: string, filePath: string, caption: string): Promise<RepostConfirmation>;
   deleteMessage(groupId: string, messageId: string): Promise<void>;
   sendText(groupId: string, text: string): Promise<void>;
 };
@@ -104,6 +105,16 @@ export function createWhatsappBot({ config, store, downloader, queue, runtimePat
   });
 
   const relayWhatsapp: WhatsappRelay = {
+    async sendVideoOnce(groupId, filePath, caption) {
+      const media = MessageMedia.fromFilePath(filePath);
+      const sent = await client.sendMessage(groupId, media, { caption, waitUntilMsgSent: true });
+      const id = messageId(sent);
+      if (!id?.trim() || !sent?.fromMe || sent.to !== groupId || !Number.isInteger(sent.ack) || sent.ack < 1 || sent.ack > 4) {
+        throw new Error('Instagram repost acceptance is unknown');
+      }
+      return { messageId: id, ack: sent.ack };
+    },
+
     async sendVideo(groupId, filePath, caption) {
       const media = MessageMedia.fromFilePath(filePath);
       let sent: Awaited<ReturnType<typeof client.sendMessage>>;
@@ -232,6 +243,7 @@ async function handleWhatsappMessage(
       sendVideo: async (targetGroupId, filePath, caption) => {
         await relayWhatsapp.sendVideo(targetGroupId, filePath, caption);
       },
+      sendVideoOnce: relayWhatsapp.sendVideoOnce,
       sendText: relayWhatsapp.sendText,
       deleteMessage: async (messageIdValue) => relayWhatsapp.deleteMessage(groupId, messageIdValue),
     },

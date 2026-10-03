@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -20,6 +20,169 @@ afterEach(() => {
 });
 
 describe('createDownloader', () => {
+  it('resolves every Instagram video in post order instead of only the last output', async () => {
+    const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      _type: 'playlist',
+      id: 'post-1',
+      entries: [
+        { id: 'video-1', formats: [{ url: 'https://media.example/one.mp4', ext: 'mp4' }] },
+        { id: 'photo-2', formats: [] },
+        { id: 'video-3', formats: [{ url: 'https://media.example/three.mp4', ext: 'mp4' }] },
+      ],
+    }) });
+
+    const source = await createDownloader({ downloadDir: createTempDir(), runner }).resolveInstagram('https://www.instagram.com/p/example/');
+
+    expect(source.id).toBe('post-1');
+    expect(source.totalItems).toBe(3);
+    expect(source.items.map(({ id, index, kind }) => ({ id, index, kind }))).toEqual([
+      { id: 'video-1', index: 1, kind: 'video' },
+      { id: 'photo-2', index: 2, kind: 'unknown' },
+      { id: 'video-3', index: 3, kind: 'video' },
+    ]);
+  });
+
+  it('honors img_index using the original collection position including photos', async () => {
+    const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      _type: 'playlist', id: 'post-1', entries: [
+        { id: 'video-1', formats: [{ url: 'https://media.example/one.mp4', ext: 'mp4' }] },
+        { id: 'photo-2', formats: [] },
+        { id: 'video-3', formats: [{ url: 'https://media.example/three.mp4', ext: 'mp4' }] },
+      ],
+    }) });
+    const source = await createDownloader({ downloadDir: createTempDir(), runner }).resolveInstagram('https://www.instagram.com/p/example/?img_index=3');
+
+    expect(source.items.map(({ id, index }) => ({ id, index }))).toEqual([{ id: 'video-3', index: 3 }]);
+    expect(source.totalItems).toBe(3);
+  });
+
+  it('does not shift a selected item when yt-dlp omits an unresolved earlier entry', async () => {
+    const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      _type: 'playlist', id: 'post-1', n_entries: 3, entries: [
+        { id: 'video-1', playlist_index: 1, formats: [{ url: 'https://media.example/one.mp4', ext: 'mp4' }] },
+        { id: 'video-3', playlist_index: 3, formats: [{ url: 'https://media.example/three.mp4', ext: 'mp4' }] },
+      ],
+    }) });
+    const source = await createDownloader({ downloadDir: createTempDir(), runner }).resolveInstagram('https://www.instagram.com/p/example/?img_index=2');
+
+    expect(source.totalItems).toBe(3);
+    expect(source.items.map(({ index, kind }) => ({ index, kind }))).toEqual([{ index: 2, kind: 'unknown' }]);
+  });
+
+  it('rejects incomplete collections whose original item positions are unknown instead of selecting a different video', async () => {
+    const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      _type: 'playlist', id: 'post-1', n_entries: 3, entries: [
+        { id: 'video-1', formats: [{ url: 'https://media.example/one.mp4', ext: 'mp4' }] },
+        { id: 'video-3', formats: [{ url: 'https://media.example/three.mp4', ext: 'mp4' }] },
+      ],
+    }) });
+
+    await expect(createDownloader({ downloadDir: createTempDir(), runner }).resolveInstagram('https://www.instagram.com/p/example/?img_index=2')).rejects.toThrow('positions are unresolved');
+  });
+
+  it('does not conflate different collection entries with the same extracted identity', async () => {
+    const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      _type: 'playlist', id: 'post-1', entries: [
+        { id: 'same-id', formats: [{ url: 'https://media.example/one.mp4', ext: 'mp4' }] },
+        { id: 'same-id', formats: [{ url: 'https://media.example/two.mp4', ext: 'mp4' }] },
+      ],
+    }) });
+    const source = await createDownloader({ downloadDir: createTempDir(), runner }).resolveInstagram('https://www.instagram.com/p/example/');
+
+    expect(source.items.map((item) => item.kind)).toEqual(['unknown', 'unknown']);
+  });
+
+  it('downloads the frozen selected entry without a parent-post URL fallback', async () => {
+    const root = createTempDir();
+    let infoPath = '';
+    const runner: DownloaderRunner = async (_file, args) => {
+      if (args.includes('--dump-single-json')) return { stdout: JSON.stringify({
+        _type: 'playlist', id: 'post-1', entries: [
+          { id: 'video-1', webpage_url: 'https://www.instagram.com/p/example/', formats: [{ url: 'https://media.example/one.mp4', ext: 'mp4' }] },
+          { id: 'video-2', webpage_url: 'https://www.instagram.com/p/example/', formats: [{ url: 'https://media.example/two.mp4', ext: 'mp4' }] },
+        ],
+      }) };
+      infoPath = args[args.indexOf('--load-info-json') + 1];
+      const info = JSON.parse(readFileSync(infoPath, 'utf8'));
+      expect(info.id).toBe('video-2');
+      expect(info).not.toHaveProperty('webpage_url');
+      expect(info.formats[0].url).toBe('https://media.example/two.mp4');
+      const filePath = join(dirname(infoPath), 'video-2.mp4');
+      writeFileSync(filePath, 'video');
+      return { stdout: `${filePath}\n` };
+    };
+    const source = await createDownloader({ downloadDir: root, runner }).resolveInstagram('https://www.instagram.com/p/example/?img_index=2');
+    const item = source.items[0];
+    expect(item.kind).toBe('video');
+    if (item.kind !== 'video') throw new Error('Expected a video');
+
+    const result = await item.download(1);
+
+    expect(result.sizeBytes).toBe(5);
+    expect(existsSync(infoPath)).toBe(false);
+  });
+
+  it.each(['0', '-1', '1.5', 'bogus', '4', '1&img_index=3', '9007199254740992'])('rejects invalid Instagram selection %s without a fallback', async (selection) => {
+    const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      _type: 'playlist', id: 'post-1', entries: [{ id: 'video-1', formats: [{ url: 'https://media.example/video.mp4', ext: 'mp4' }] }],
+    }) });
+    await expect(createDownloader({ downloadDir: createTempDir(), runner }).resolveInstagram(`https://www.instagram.com/p/example/?img_index=${selection}`)).rejects.toThrow('selection');
+  });
+
+  it('preserves unknown, image-only, and missing-identity entries without treating audio as video', async () => {
+    const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      _type: 'playlist', id: 'post-1', entries: [
+        null,
+        { formats: [{ url: 'https://media.example/no-id.mp4', ext: 'mp4' }] },
+        { id: 'photo', formats: [] },
+        { id: 'audio', formats: [{ url: 'https://media.example/audio.mp4', ext: 'mp4', vcodec: 'none' }] },
+      ],
+    }) });
+    const source = await createDownloader({ downloadDir: createTempDir(), runner }).resolveInstagram('https://www.instagram.com/p/example/');
+
+    expect(source.items.map((item) => item.kind)).toEqual(['unknown', 'unknown', 'unknown', 'unknown']);
+    expect(source.totalItems).toBe(4);
+  });
+
+  it.each(['oversize', 'multiple', 'empty', 'outside'])('rejects an unsafe individual Instagram output: %s', async (mode) => {
+    const root = createTempDir();
+    let outputDir = '';
+    const outsidePath = join(root, 'keep.mp4');
+    writeFileSync(outsidePath, 'keep');
+    const runner: DownloaderRunner = async (_file, args) => {
+      if (args.includes('--dump-single-json')) return { stdout: JSON.stringify({ id: 'video-1', formats: [{ url: 'https://media.example/one.mp4', ext: 'mp4' }] }) };
+      outputDir = dirname(args[args.indexOf('--load-info-json') + 1]);
+      const filePath = join(outputDir, 'video.mp4');
+      writeFileSync(filePath, mode === 'oversize' ? Buffer.alloc(2 * 1024 * 1024) : mode === 'empty' ? '' : 'video');
+      return { stdout: mode === 'outside' ? outsidePath : mode === 'multiple' ? `${filePath}\n${filePath}` : filePath };
+    };
+    const source = await createDownloader({ downloadDir: root, runner }).resolveInstagram('https://www.instagram.com/p/example/');
+    const item = source.items[0];
+    if (item.kind !== 'video') throw new Error('Expected a video');
+
+    await expect(item.download(1)).rejects.toThrow();
+
+    expect(existsSync(outputDir)).toBe(false);
+    expect(readFileSync(outsidePath, 'utf8')).toBe('keep');
+  });
+
+  it('checks the duration of each Instagram video before downloading that item', async () => {
+    const calls: Parameters<DownloaderRunner>[] = [];
+    const runner: DownloaderRunner = async (...args) => {
+      calls.push(args);
+      return { stdout: JSON.stringify({ _type: 'playlist', id: 'post-1', entries: [
+        { id: 'long-video', duration: 121, formats: [{ url: 'https://media.example/long.mp4', ext: 'mp4' }] },
+        { id: 'short-video', duration: 5, formats: [{ url: 'https://media.example/short.mp4', ext: 'mp4' }] },
+      ] }) };
+    };
+    const source = await createDownloader({ downloadDir: createTempDir(), runner, options: { maxDurationSeconds: 120 } }).resolveInstagram('https://www.instagram.com/p/example/');
+    const item = source.items[0];
+    if (item.kind !== 'video') throw new Error('Expected a video');
+
+    await expect(item.download(1)).rejects.toThrow('Video exceeds 120 seconds');
+    expect(calls).toHaveLength(1);
+  });
+
   it('downloads to the configured directory and returns file size when within limit', async () => {
     const downloadDir = join(createTempDir(), 'downloads');
     let filePath = '';

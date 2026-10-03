@@ -17,6 +17,10 @@ export type RepostRecord = {
   createdAtMs: number;
 };
 
+export type InstagramItemKey = { groupId: string; messageId: string; postId: string; itemId: string };
+export type RepostConfirmation = { messageId: string; ack: number };
+export type InstagramItemProgress = { status: 'sending' | 'confirmed'; sentMessageId: string | null; ack: number | null };
+
 export type StoreDefaults = {
   maxFileSizeMb?: number;
   duplicateWindowHours?: number;
@@ -39,6 +43,9 @@ export type Store = {
   getBotOwnerId(): string | null;
   recordRepost(record: RepostRecord): void;
   recordSuccessfulRepost(record: RepostRecord): void;
+  getInstagramItem(key: InstagramItemKey): InstagramItemProgress | null;
+  beginInstagramItem(key: InstagramItemKey, nowMs: number): boolean;
+  confirmInstagramItem(key: InstagramItemKey, confirmation: RepostConfirmation, record: RepostRecord): void;
   countReposts(): number;
   close(): void;
 };
@@ -115,6 +122,18 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS instagram_relay_items (
+      group_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      post_id TEXT NOT NULL,
+      item_id TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('sending', 'confirmed')),
+      started_at_ms INTEGER NOT NULL,
+      sent_message_id TEXT,
+      ack INTEGER,
+      PRIMARY KEY (group_id, message_id, post_id, item_id)
+    );
   `);
 
   const insertDefaultSettings = db.prepare(`
@@ -172,6 +191,26 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
   const recordSuccessfulRepost = db.transaction((record: RepostRecord) => {
     insertRepost.run(record.groupId, record.senderId, record.url, record.urlHash, record.createdAtMs);
     upsertDuplicate.run(record.groupId, record.urlHash, record.createdAtMs);
+  });
+  const selectInstagramItem = db.prepare<[string, string, string, string], InstagramItemProgress>(`
+    SELECT status, sent_message_id AS sentMessageId, ack FROM instagram_relay_items
+    WHERE group_id = ? AND message_id = ? AND post_id = ? AND item_id = ?
+  `);
+  const beginInstagramItem = db.prepare(`
+    INSERT OR IGNORE INTO instagram_relay_items (group_id, message_id, post_id, item_id, status, started_at_ms)
+    VALUES (?, ?, ?, ?, 'sending', ?)
+  `);
+  const confirmInstagramItem = db.prepare(`
+    UPDATE instagram_relay_items SET status = 'confirmed', sent_message_id = ?, ack = ?
+    WHERE group_id = ? AND message_id = ? AND post_id = ? AND item_id = ? AND status = 'sending'
+  `);
+  const recordInstagramConfirmation = db.transaction((key: InstagramItemKey, confirmation: RepostConfirmation, record: RepostRecord) => {
+    if (!confirmation.messageId.trim() || !Number.isInteger(confirmation.ack) || confirmation.ack < 1 || confirmation.ack > 4) {
+      throw new Error('Instagram repost lacks server acknowledgement');
+    }
+    const changed = confirmInstagramItem.run(confirmation.messageId, confirmation.ack, key.groupId, key.messageId, key.postId, key.itemId);
+    if (!changed.changes) throw new Error('Instagram send reservation is missing or already confirmed');
+    insertRepost.run(record.groupId, record.senderId, record.url, record.urlHash, record.createdAtMs);
   });
 
   return {
@@ -239,6 +278,19 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
     },
 
     recordSuccessfulRepost,
+
+    getInstagramItem(key) {
+      return selectInstagramItem.get(key.groupId, key.messageId, key.postId, key.itemId) ?? null;
+    },
+
+    beginInstagramItem(key, nowMs) {
+      if (![key.groupId, key.messageId, key.postId, key.itemId].every((value) => value.trim())) {
+        throw new Error('Instagram send requires source and item identities');
+      }
+      return Boolean(beginInstagramItem.run(key.groupId, key.messageId, key.postId, key.itemId, nowMs).changes);
+    },
+
+    confirmInstagramItem: recordInstagramConfirmation,
 
     countReposts() {
       return selectRepostCount.get()?.count ?? 0;
