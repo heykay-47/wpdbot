@@ -1,28 +1,39 @@
 # wpdbot
 
-WhatsApp group media relay bot for personal use. It watches enabled WhatsApp groups for Instagram reels/posts and YouTube Shorts, downloads the media with `yt-dlp`, reposts the video in the same group with attribution, and skips duplicate links inside a configurable time window.
+WhatsApp group media relay bot for personal use. It watches enabled WhatsApp groups for Instagram reels/posts and YouTube Shorts, downloads the media with `yt-dlp`, reposts the video in the same group with attribution, and skips previously confirmed videos inside each group's duplicate window.
 
 ## Features
 
 - Relays Instagram reels/posts and YouTube Shorts in WhatsApp groups.
 - Uses `whatsapp-web.js` with QR login and persisted WhatsApp Web session data.
-- Downloads media with `yt-dlp` and uses `ffmpeg` for WhatsApp-compatible retry transcodes.
-- Attempts original-link cleanup after the existing YouTube relay succeeds; Instagram sources are retained.
-- Skips duplicate URLs per group within a configurable window.
+- Downloads identified videos with `yt-dlp`, using `ffmpeg` where stream merging requires it.
+- Retains source messages for both platforms until the remaining cleanup safeguards are implemented.
+- Suppresses equivalent-video reposts per group, with durable protection for unresolved sends.
 - Supports per-group enable/disable/status commands.
 - Runs as a Docker Compose service with persisted auth, cache, database, and download volumes.
+
+### Equivalent links and safe sends
+
+- Supported URLs remain YouTube `/shorts/` and Instagram `/p/` or `/reel/` on the existing bare, `www`, and `m` hosts. Only the first supported source link in a message is processed in this implementation.
+- Ordinary YouTube Shorts links with the same exact, case-sensitive video ID share an identity across accepted hostname aliases, HTTP/HTTPS, fragments, trailing slashes, and the already-recognized `utm_*`, `fbclid`, and `igsh` tracking parameters. Different uploads of the same footage are not detected as content duplicates.
+- Instagram video identities use the resolved parent-post and video-item IDs. Sharing item 3, then the whole collection, reposts only its other unconfirmed videos inside the window. Sharing the whole collection, then item 3, does not repost that video again inside the window. `/p/` versus `/reel/` alone does not identify one equal video.
+- Arbitrary queries, encoded/malformed IDs, unusual paths, long shortcode variants, and mobile Instagram links do not receive guessed equivalence. The submitted URL is kept for extraction and attribution. Verified metadata may establish an identity; otherwise no video is sent and the source remains visible. Fixture success does not prove mobile Instagram extraction works in a deployment.
+- A group's duplicate window starts when a repost's confirmation is observed, not when its source was posted or queued. Duplicate skips do not extend it. A new source message may request another repost after expiry. Confirmed outcomes for the same source message remain completed even after expiry or restart. Queued work rechecks current settings and time.
+- Both platforms use one submission attempt without automatic transcode or document retries. Confirmation requires a sent-message ID and an observed server-or-stronger acknowledgement in the originating group. It does not prove every participant received the repost.
+- Identity-based send reservations are stored before submission. An unresolved send blocks that video across source messages and restarts, regardless of duplicate-window expiry. A definite inspection/download failure does not create a confirmed duplicate marker. A submitted video whose confirmation cannot be recorded remains held rather than being sent again.
+- All source messages remain intact, including duplicate-only and mixed new/duplicate requests. General reconciliation, authorized retry commands, media fallbacks, and guarded source cleanup remain later work. Do not erase progress records to force another send.
+
+SQLite initialization adds `media_relay_attempts` without rewriting existing settings, history, URL hashes, or `instagram_relay_items`. Legacy URL markers still suppress only their exact legacy-normalized URL in the same group/window; they are not promoted to ACK-confirmed identities or broadened to aliases. Old Instagram confirmations still protect the same source message, and old unresolved items protect the same resolved video across messages. Old records have no reliable confirmation timestamp, so no canonical windows are backfilled. A newly encountered URL alias can therefore be reposted despite an old URL-only marker.
+
+A zero-hour stored group window disables prior-message confirmed suppression, not unresolved-send protection or same-source completion. Existing `.env` validation still requires a positive `DUPLICATE_WINDOW_HOURS`; new group-setting commands and ranges are not part of this change. Back up the database before updating a deployment, and do not run old and new relay versions against the same database concurrently.
 
 ### Instagram collections
 
 - A post with several videos reposts each verifiable video in post order. Photos and entries without reliable video metadata are not reposted.
 - A source link with `img_index=3` requests only the third media item, counting photos as positions too. An invalid, unavailable, or non-video selection does not fall back to another video.
 - A failed item download does not prevent other verifiable videos from being processed. Each downloaded video must meet the configured file-size limit; configured duration checks apply to each item's available metadata.
-- Instagram source messages are always retained in this first implementation, including fully reposted single-video posts. Safe automatic cleanup awaits the remaining restart-recovery and deletion-guard work.
-- Instagram sends use one submission attempt without automatic transcode or document retries. A confirmed repost requires a sent-message ID and an observed server-or-stronger acknowledgement in the originating group. This does not prove every participant received it.
-- A send reservation is stored before submission. If the process stops, submission throws, acceptance remains uncertain, or recording confirmation fails, that item's outcome remains unresolved and the same source message will not automatically resend it. Confirmed items are also skipped if the source event is received again after restart.
+- Instagram source messages are always retained, including fully reposted single-video posts. Safe automatic cleanup awaits the remaining restart-recovery and deletion-guard work.
 - Unresolved sends stop the collection. There is no automatic reconciliation or recovery command yet. Do not erase progress records to force a retry; review the group first because the video may already be present.
-
-SQLite initialization adds `instagram_relay_items` without changing or removing existing settings, duplicate records, or repost history. This progress is scoped to the group, source-message ID, extracted post ID, and entry ID. Existing normalized-URL duplicate windows remain in use; equivalence across different source messages or URL variants is still a separate planning task. Back up the database before updating an existing deployment.
 
 Metadata handling is conservative when yt-dlp omits entries or cannot establish their positions. Its deployed version is not pinned by this project, so fixture-based checks do not replace a separately authorized private-group smoke test.
 
@@ -103,7 +114,7 @@ Configure the bot with `.env`.
 | `SQLITE_PATH` | `./data/bot.db` | SQLite database path. Docker Compose overrides this to `/data/bot.db`. |
 | `TIMEZONE` | `Asia/Kolkata` | Timezone used in repost captions. |
 | `MAX_FILE_SIZE_MB` | `64` | Maximum downloaded file size per relay. |
-| `DUPLICATE_WINDOW_HOURS` | `24` | How long repeated links are skipped per group. |
+| `DUPLICATE_WINDOW_HOURS` | `24` | Initial positive duplicate window for new groups, measured from observed confirmation. Existing group settings are preserved. |
 | `DOWNLOAD_DIR` | `/tmp/wpdbot-downloads` | Temporary download directory. |
 | `WHATSAPP_AUTH_DIR` | Docker: `/app/.wwebjs_auth` | Optional WhatsApp auth directory override. Usually leave unset outside Docker. |
 | `WHATSAPP_CACHE_DIR` | Docker: `/app/.wwebjs_cache` | Optional WhatsApp cache directory override. Usually leave unset outside Docker. |
@@ -263,7 +274,7 @@ After pulling, reapply only the changes you still need.
 
 ### YouTube Shorts Fail With "Download Unavailable Or Blocked" On A Cloud Server
 
-YouTube enforces PO (Proof of Origin) Token authentication and may return `LOGIN_REQUIRED` for requests from datacenter or cloud IPs (DigitalOcean, AWS, GCP, etc.) even when a PO token is provided. The error is sent to WhatsApp as "Could not download this video: Download unavailable or blocked." but does not appear in Docker logs because it is treated as a user-facing error internally.
+YouTube enforces PO (Proof of Origin) Token authentication and may return `LOGIN_REQUIRED` for requests from datacenter or cloud IPs (DigitalOcean, AWS, GCP, etc.) even when a PO token is provided. Inspection failures now produce "Could not establish this YouTube video identity. Original message kept." Download failures produce "Could not download this video: Download unavailable or blocked. Original message kept." These user-facing errors still bypass diagnostic logging; richer diagnostics remain later work.
 
 Two things must be in place for YouTube Shorts to work reliably from a cloud server:
 
@@ -356,7 +367,7 @@ Keep the `wpdbot-data` volume unless you also want to erase group settings and r
 - Send `!bot status` and confirm bot admin shows `yes`.
 - Send `!bot enable` and confirm enabled response.
 - Send one YouTube Shorts link, one Instagram reel link, and one Instagram post link.
-- Confirm reposts, captions, and duplicate skips. Instagram source messages must remain visible; verify the existing YouTube cleanup separately.
+- Confirm reposts, captions, equivalent-link duplicate skips, and source retention for both platforms. Automatic source cleanup is disabled in the incoming relay.
 - Test an Instagram collection containing several videos and a photo, then a link selecting a video with `img_index`. Verify video order, photo omission, selected-item attribution, and source retention.
 - Send an unsupported link and confirm the bot ignores it.
 - Send `!bot disable` and confirm future links are ignored.

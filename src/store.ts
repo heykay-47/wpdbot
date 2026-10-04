@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
+import { mediaIdentityKey, type MediaIdentity } from './mediaIdentity.js';
 
 export type GroupSettings = {
   groupId: string;
@@ -20,6 +21,9 @@ export type RepostRecord = {
 export type InstagramItemKey = { groupId: string; messageId: string; postId: string; itemId: string };
 export type RepostConfirmation = { messageId: string; ack: number };
 export type InstagramItemProgress = { status: 'sending' | 'confirmed'; sentMessageId: string | null; ack: number | null };
+
+export type MediaRepostKey = { groupId: string; messageId: string; identity: MediaIdentity };
+export type MediaDisposition = 'ready' | 'completed' | 'duplicate' | 'held';
 
 export type StoreDefaults = {
   maxFileSizeMb?: number;
@@ -46,6 +50,9 @@ export type Store = {
   getInstagramItem(key: InstagramItemKey): InstagramItemProgress | null;
   beginInstagramItem(key: InstagramItemKey, nowMs: number): boolean;
   confirmInstagramItem(key: InstagramItemKey, confirmation: RepostConfirmation, record: RepostRecord): void;
+  getMediaDisposition(key: MediaRepostKey, nowMs: number, windowHours: number): MediaDisposition;
+  beginMediaRepost(key: MediaRepostKey, record: RepostRecord, windowHours: number): 'started' | Exclude<MediaDisposition, 'ready'>;
+  confirmMediaRepost(key: MediaRepostKey, confirmation: RepostConfirmation, record: RepostRecord): void;
   countReposts(): number;
   close(): void;
 };
@@ -134,6 +141,21 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
       ack INTEGER,
       PRIMARY KEY (group_id, message_id, post_id, item_id)
     );
+
+    CREATE TABLE IF NOT EXISTS media_relay_attempts (
+      group_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      media_key TEXT NOT NULL,
+      source_url TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('sending', 'confirmed')),
+      started_at_ms INTEGER NOT NULL,
+      confirmed_at_ms INTEGER,
+      sent_message_id TEXT,
+      ack INTEGER,
+      PRIMARY KEY (group_id, message_id, media_key)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS media_relay_pending
+      ON media_relay_attempts (group_id, media_key) WHERE status = 'sending';
   `);
 
   const insertDefaultSettings = db.prepare(`
@@ -210,6 +232,60 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
     }
     const changed = confirmInstagramItem.run(confirmation.messageId, confirmation.ack, key.groupId, key.messageId, key.postId, key.itemId);
     if (!changed.changes) throw new Error('Instagram send reservation is missing or already confirmed');
+    insertRepost.run(record.groupId, record.senderId, record.url, record.urlHash, record.createdAtMs);
+  });
+
+  const selectPendingMedia = db.prepare<[string, string], { message_id: string }>(`
+    SELECT message_id FROM media_relay_attempts WHERE group_id = ? AND media_key = ? AND status = 'sending'
+  `);
+  const insertMediaAttempt = db.prepare(`
+    INSERT INTO media_relay_attempts (group_id, message_id, media_key, source_url, status, started_at_ms)
+    VALUES (?, ?, ?, ?, 'sending', ?)
+  `);
+  const selectSourceMedia = db.prepare<[string, string, string], { status: 'sending' | 'confirmed' }>(`
+    SELECT status FROM media_relay_attempts WHERE group_id = ? AND message_id = ? AND media_key = ?
+  `);
+  const selectMediaConfirmation = db.prepare<[string, string], { confirmedAtMs: number | null }>(`
+    SELECT max(confirmed_at_ms) AS confirmedAtMs FROM media_relay_attempts
+    WHERE group_id = ? AND media_key = ? AND status = 'confirmed'
+  `);
+  const updateMediaConfirmation = db.prepare(`
+    UPDATE media_relay_attempts SET status = 'confirmed', confirmed_at_ms = ?, sent_message_id = ?, ack = ?
+    WHERE group_id = ? AND message_id = ? AND media_key = ? AND source_url = ? AND status = 'sending'
+  `);
+  const selectLegacyPendingItem = db.prepare<[string, string, string], { message_id: string }>(`
+    SELECT message_id FROM instagram_relay_items
+    WHERE group_id = ? AND post_id = ? AND item_id = ? AND status = 'sending' LIMIT 1
+  `);
+  const getMediaDisposition = (key: MediaRepostKey, nowMs: number, windowHours: number): MediaDisposition => {
+    const identityKey = mediaIdentityKey(key.identity);
+    if (selectSourceMedia.get(key.groupId, key.messageId, identityKey)?.status === 'confirmed') return 'completed';
+    if (key.identity.platform === 'instagram') {
+      const { postId, itemId } = key.identity;
+      if (selectInstagramItem.get(key.groupId, key.messageId, postId, itemId)?.status === 'confirmed') return 'completed';
+      if (selectLegacyPendingItem.get(key.groupId, postId, itemId)) return 'held';
+    }
+    if (selectPendingMedia.get(key.groupId, identityKey)) return 'held';
+    const confirmedAtMs = selectMediaConfirmation.get(key.groupId, identityKey)?.confirmedAtMs;
+    if (windowHours > 0 && confirmedAtMs != null && nowMs - confirmedAtMs <= windowHours * 60 * 60 * 1000) return 'duplicate';
+    return 'ready';
+  };
+  const beginMediaRepost = db.transaction((key: MediaRepostKey, record: RepostRecord, windowHours: number): ReturnType<Store['beginMediaRepost']> => {
+    if (record.groupId !== key.groupId || !key.groupId.trim() || !key.messageId.trim()) throw new Error('Media send requires matching group and source identities');
+    if (!Number.isSafeInteger(record.createdAtMs)) throw new Error('Media send timestamp is invalid');
+    const disposition = getMediaDisposition(key, record.createdAtMs, windowHours);
+    if (disposition !== 'ready') return disposition;
+    insertMediaAttempt.run(key.groupId, key.messageId, mediaIdentityKey(key.identity), record.url, record.createdAtMs);
+    return 'started';
+  });
+  const confirmMediaRepost = db.transaction((key: MediaRepostKey, confirmation: RepostConfirmation, record: RepostRecord) => {
+    if (record.groupId !== key.groupId || !confirmation.messageId.trim() || !Number.isInteger(confirmation.ack) || confirmation.ack < 1 || confirmation.ack > 4) {
+      throw new Error('Media repost lacks matching group and server acknowledgement');
+    }
+    if (!Number.isSafeInteger(record.createdAtMs)) throw new Error('Media confirmation timestamp is invalid');
+    const changed = updateMediaConfirmation.run(record.createdAtMs, confirmation.messageId, confirmation.ack,
+      key.groupId, key.messageId, mediaIdentityKey(key.identity), record.url);
+    if (!changed.changes) throw new Error('Media send reservation is missing or already confirmed');
     insertRepost.run(record.groupId, record.senderId, record.url, record.urlHash, record.createdAtMs);
   });
 
@@ -291,6 +367,12 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
     },
 
     confirmInstagramItem: recordInstagramConfirmation,
+
+    getMediaDisposition,
+
+    beginMediaRepost: beginMediaRepost.immediate,
+
+    confirmMediaRepost,
 
     countReposts() {
       return selectRepostCount.get()?.count ?? 0;

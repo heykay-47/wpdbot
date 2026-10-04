@@ -20,8 +20,71 @@ afterEach(() => {
 });
 
 describe('createDownloader', () => {
+  it('resolves a YouTube video identity and downloads that frozen video rather than re-extracting the source URL', async () => {
+    const root = createTempDir();
+    let infoPath = '';
+    const runner: DownloaderRunner = async (_file, args) => {
+      if (args.includes('--dump-single-json')) {
+        expect(args).not.toContain('--ignore-config');
+        return { stdout: JSON.stringify({
+          id: 'AbCdEf123_-', extractor_key: 'Youtube', webpage_url: 'https://www.youtube.com/watch?v=AbCdEf123_-',
+          original_url: 'https://m.youtube.com/shorts/AbCdEf123_-',
+          formats: [{ url: 'https://media.example/youtube.mp4', ext: 'mp4' }],
+        }) };
+      }
+      infoPath = args[args.indexOf('--load-info-json') + 1];
+      const info = JSON.parse(readFileSync(infoPath, 'utf8'));
+      expect(info.id).toBe('AbCdEf123_-');
+      expect(info).not.toHaveProperty('webpage_url');
+      expect(info).not.toHaveProperty('original_url');
+      expect(info.formats[0].url).toBe('https://media.example/youtube.mp4');
+      const path = join(dirname(infoPath), 'AbCdEf123_-.mp4');
+      writeFileSync(path, 'youtube-video');
+      return { stdout: path };
+    };
+
+    const video = await createDownloader({ downloadDir: root, runner }).resolveYouTube('https://m.youtube.com/shorts/AbCdEf123_-');
+    expect(video.id).toBe('AbCdEf123_-');
+    const download = await video.download(1);
+    expect(readFileSync(download.filePath, 'utf8')).toBe('youtube-video');
+    expect(existsSync(infoPath)).toBe(false);
+  });
+
+  it.each([
+    { id: 'AbCdEf123_-', formats: [{ url: 'https://media.example/video.mp4', ext: 'mp4' }] },
+    { id: 'AbCdEf123_-', extractor_key: 'Instagram', formats: [{ url: 'https://media.example/video.mp4', ext: 'mp4' }] },
+    { id: 'Another123_', extractor_key: 'Youtube', formats: [{ url: 'https://media.example/video.mp4', ext: 'mp4' }] },
+    { id: 'AbCdEf123_-', extractor_key: 'Youtube', _type: 'playlist', entries: [] },
+    { id: 'AbCdEf123_-', extractor_key: 'Youtube', formats: [] },
+    { id: 'AbCdEf123_-', extractor_key: 'Youtube', formats: [{ url: 'https://media.example/audio.mp4', ext: 'mp4', vcodec: 'none' }] },
+    { extractor_key: 'Youtube', formats: [{ url: 'https://media.example/video.mp4', ext: 'mp4' }] },
+  ])('rejects unverified or mismatched YouTube identity metadata %#', async (metadata) => {
+    const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify(metadata) });
+    await expect(createDownloader({ downloadDir: createTempDir(), runner }).resolveYouTube('https://youtube.com/shorts/AbCdEf123_-')).rejects.toThrow();
+  });
+
+  it.each([undefined, 'Youtube', 'Generic'])('does not assign Instagram identities to unverified extractor metadata %s', async (extractor) => {
+    const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      id: 'post-1', extractor_key: extractor, formats: [{ url: 'https://media.example/video.mp4', ext: 'mp4' }],
+    }) });
+    await expect(createDownloader({ downloadDir: createTempDir(), runner }).resolveInstagram('https://m.instagram.com/p/example/')).rejects.toThrow();
+  });
+
+  it('does not identify foreign-platform or unresolved collection entries as Instagram videos', async () => {
+    const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      id: 'post-1', extractor_key: 'Instagram', _type: 'playlist', entries: [
+        { id: 'foreign', extractor_key: 'Youtube', formats: [{ url: 'https://media.example/foreign.mp4', ext: 'mp4' }] },
+        { id: 'nested', _type: 'playlist', formats: [{ url: 'https://media.example/nested.mp4', ext: 'mp4' }] },
+        { id: 'unresolved', _type: 'url', formats: [{ url: 'https://media.example/unresolved.mp4', ext: 'mp4' }] },
+      ],
+    }) });
+    const source = await createDownloader({ downloadDir: createTempDir(), runner }).resolveInstagram('https://instagram.com/p/example/');
+    expect(source.items.map((item) => item.kind)).toEqual(['unknown', 'unknown', 'unknown']);
+  });
+
   it('resolves every Instagram video in post order instead of only the last output', async () => {
     const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      extractor_key: 'Instagram',
       _type: 'playlist',
       id: 'post-1',
       entries: [
@@ -44,6 +107,7 @@ describe('createDownloader', () => {
 
   it('honors img_index using the original collection position including photos', async () => {
     const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      extractor_key: 'Instagram',
       _type: 'playlist', id: 'post-1', entries: [
         { id: 'video-1', formats: [{ url: 'https://media.example/one.mp4', ext: 'mp4' }] },
         { id: 'photo-2', formats: [] },
@@ -58,6 +122,7 @@ describe('createDownloader', () => {
 
   it('does not shift a selected item when yt-dlp omits an unresolved earlier entry', async () => {
     const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      extractor_key: 'Instagram',
       _type: 'playlist', id: 'post-1', n_entries: 3, entries: [
         { id: 'video-1', playlist_index: 1, formats: [{ url: 'https://media.example/one.mp4', ext: 'mp4' }] },
         { id: 'video-3', playlist_index: 3, formats: [{ url: 'https://media.example/three.mp4', ext: 'mp4' }] },
@@ -71,6 +136,7 @@ describe('createDownloader', () => {
 
   it('rejects incomplete collections whose original item positions are unknown instead of selecting a different video', async () => {
     const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      extractor_key: 'Instagram',
       _type: 'playlist', id: 'post-1', n_entries: 3, entries: [
         { id: 'video-1', formats: [{ url: 'https://media.example/one.mp4', ext: 'mp4' }] },
         { id: 'video-3', formats: [{ url: 'https://media.example/three.mp4', ext: 'mp4' }] },
@@ -82,6 +148,7 @@ describe('createDownloader', () => {
 
   it('does not conflate different collection entries with the same extracted identity', async () => {
     const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      extractor_key: 'Instagram',
       _type: 'playlist', id: 'post-1', entries: [
         { id: 'same-id', formats: [{ url: 'https://media.example/one.mp4', ext: 'mp4' }] },
         { id: 'same-id', formats: [{ url: 'https://media.example/two.mp4', ext: 'mp4' }] },
@@ -97,7 +164,7 @@ describe('createDownloader', () => {
     let infoPath = '';
     const runner: DownloaderRunner = async (_file, args) => {
       if (args.includes('--dump-single-json')) return { stdout: JSON.stringify({
-        _type: 'playlist', id: 'post-1', entries: [
+        extractor_key: 'Instagram', _type: 'playlist', id: 'post-1', entries: [
           { id: 'video-1', webpage_url: 'https://www.instagram.com/p/example/', formats: [{ url: 'https://media.example/one.mp4', ext: 'mp4' }] },
           { id: 'video-2', webpage_url: 'https://www.instagram.com/p/example/', formats: [{ url: 'https://media.example/two.mp4', ext: 'mp4' }] },
         ],
@@ -124,6 +191,7 @@ describe('createDownloader', () => {
 
   it.each(['0', '-1', '1.5', 'bogus', '4', '1&img_index=3', '9007199254740992'])('rejects invalid Instagram selection %s without a fallback', async (selection) => {
     const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      extractor_key: 'Instagram',
       _type: 'playlist', id: 'post-1', entries: [{ id: 'video-1', formats: [{ url: 'https://media.example/video.mp4', ext: 'mp4' }] }],
     }) });
     await expect(createDownloader({ downloadDir: createTempDir(), runner }).resolveInstagram(`https://www.instagram.com/p/example/?img_index=${selection}`)).rejects.toThrow('selection');
@@ -131,6 +199,7 @@ describe('createDownloader', () => {
 
   it('preserves unknown, image-only, and missing-identity entries without treating audio as video', async () => {
     const runner: DownloaderRunner = async () => ({ stdout: JSON.stringify({
+      extractor_key: 'Instagram',
       _type: 'playlist', id: 'post-1', entries: [
         null,
         { formats: [{ url: 'https://media.example/no-id.mp4', ext: 'mp4' }] },
@@ -150,7 +219,7 @@ describe('createDownloader', () => {
     const outsidePath = join(root, 'keep.mp4');
     writeFileSync(outsidePath, 'keep');
     const runner: DownloaderRunner = async (_file, args) => {
-      if (args.includes('--dump-single-json')) return { stdout: JSON.stringify({ id: 'video-1', formats: [{ url: 'https://media.example/one.mp4', ext: 'mp4' }] }) };
+      if (args.includes('--dump-single-json')) return { stdout: JSON.stringify({ extractor_key: 'Instagram', id: 'video-1', formats: [{ url: 'https://media.example/one.mp4', ext: 'mp4' }] }) };
       outputDir = dirname(args[args.indexOf('--load-info-json') + 1]);
       const filePath = join(outputDir, 'video.mp4');
       writeFileSync(filePath, mode === 'oversize' ? Buffer.alloc(2 * 1024 * 1024) : mode === 'empty' ? '' : 'video');
@@ -170,7 +239,7 @@ describe('createDownloader', () => {
     const calls: Parameters<DownloaderRunner>[] = [];
     const runner: DownloaderRunner = async (...args) => {
       calls.push(args);
-      return { stdout: JSON.stringify({ _type: 'playlist', id: 'post-1', entries: [
+      return { stdout: JSON.stringify({ extractor_key: 'Instagram', _type: 'playlist', id: 'post-1', entries: [
         { id: 'long-video', duration: 121, formats: [{ url: 'https://media.example/long.mp4', ext: 'mp4' }] },
         { id: 'short-video', duration: 5, formats: [{ url: 'https://media.example/short.mp4', ext: 'mp4' }] },
       ] }) };

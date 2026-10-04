@@ -1,10 +1,12 @@
 import { mkdir, mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, relative } from 'node:path';
 import { execa } from 'execa';
+import { candidateMediaIdentity, isYouTubeVideoId } from './mediaIdentity.js';
 
 export type DownloaderRunner = (file: string, args: string[]) => Promise<{ stdout: string }>;
 
 export type DownloaderResult = { filePath: string; sizeBytes: number; tempDir: string };
+export type YouTubeVideo = { id: string; download(maxFileSizeMb: number): Promise<DownloaderResult> };
 
 export type InstagramItem = {
   id: string;
@@ -27,6 +29,7 @@ export type DownloadOptions = {
 
 export type Downloader = {
   download(url: string, maxFileSizeMb: number): Promise<DownloaderResult>;
+  resolveYouTube(url: string): Promise<YouTubeVideo>;
   resolveInstagram(url: string): Promise<InstagramSource>;
 };
 
@@ -59,6 +62,26 @@ async function assertDurationAllowed(runner: DownloaderRunner, url: string, opti
 
 export function createDownloader({ downloadDir, runner = defaultRunner, options = {} }: DownloaderOptions): Downloader {
   return {
+    async resolveYouTube(url) {
+      // Docker's yt-dlp config supplies the existing PO-token provider endpoint.
+      const args = appendSharedArgs(['--no-playlist', '--dump-single-json', '--skip-download'], options);
+      args.push(url);
+      const { stdout } = await runner('yt-dlp', args);
+      const metadata: unknown = JSON.parse(stdout.trim());
+      if (!isRecord(metadata) || !isYouTubeVideoId(metadata.id)) {
+        throw new Error('YouTube video identity is unavailable');
+      }
+      const candidate = candidateMediaIdentity(url);
+      if (metadata.extractor_key !== 'Youtube' || (metadata._type !== undefined && metadata._type !== 'video')
+        || !hasVideoFormats(metadata) || (candidate?.platform === 'youtube' && candidate.videoId !== metadata.id)) {
+        throw new Error('YouTube video identity or metadata is unresolved');
+      }
+      return {
+        id: metadata.id,
+        download: (maxFileSizeMb) => downloadResolvedVideo(metadata, maxFileSizeMb, downloadDir, runner, options, 'YouTube'),
+      };
+    },
+
     async resolveInstagram(url) {
       const args = appendSharedArgs(['--ignore-config', '--no-playlist', '--dump-single-json', '--skip-download', '--ignore-no-formats-error'], options);
       args.push(url);
@@ -67,6 +90,7 @@ export function createDownloader({ downloadDir, runner = defaultRunner, options 
       if (!isRecord(metadata) || typeof metadata.id !== 'string' || !metadata.id.trim()) {
         throw new Error('Instagram post identity is unavailable');
       }
+      if (metadata.extractor_key !== 'Instagram') throw new Error('Instagram extractor identity is unavailable');
       if (metadata._type !== undefined && metadata._type !== 'video' && metadata._type !== 'playlist') {
         throw new Error('Instagram media metadata is unresolved');
       }
@@ -112,16 +136,15 @@ export function createDownloader({ downloadDir, runner = defaultRunner, options 
           : [[selectedIndex, indexedEntries.get(selectedIndex)] as const]).map(([index, entry]): InstagramItem => {
           if (!isRecord(entry)) return { index, kind: 'unknown' };
           const id = typeof entry.id === 'string' && entry.id.trim() ? entry.id : undefined;
-          const formats = Array.isArray(entry.formats) ? entry.formats.filter(isRecord) : [entry];
-          const hasVideo = formats.some((format) => typeof format.url === 'string' && format.vcodec !== 'none'
-            && (typeof format.vcodec === 'string' || /^(mp4|webm|mov|mkv|m4v)$/u.test(String(format.ext))));
-          if (!id || identities.get(id) !== 1 || !hasVideo) return { id, index, kind: 'unknown' };
+          if ((entry.extractor_key !== undefined && entry.extractor_key !== 'Instagram')
+            || (entry._type !== undefined && entry._type !== 'video')) return { id, index, kind: 'unknown' };
+          if (!id || identities.get(id) !== 1 || !hasVideoFormats(entry)) return { id, index, kind: 'unknown' };
 
           return {
             id,
             index,
             kind: 'video',
-            download: (maxFileSizeMb) => downloadInstagramItem(entry, maxFileSizeMb, downloadDir, runner, options),
+            download: (maxFileSizeMb) => downloadResolvedVideo(entry, maxFileSizeMb, downloadDir, runner, options, 'Instagram'),
           };
         }),
       };
@@ -169,7 +192,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-async function downloadInstagramItem(metadata: Record<string, unknown>, maxFileSizeMb: number, downloadDir: string, runner: DownloaderRunner, options: DownloadOptions): Promise<DownloaderResult> {
+function hasVideoFormats(metadata: Record<string, unknown>): boolean {
+  const formats = Array.isArray(metadata.formats) ? metadata.formats.filter(isRecord) : [metadata];
+  return formats.some((format) => typeof format.url === 'string' && format.vcodec !== 'none'
+    && (typeof format.vcodec === 'string' || /^(mp4|webm|mov|mkv|m4v)$/u.test(String(format.ext))));
+}
+
+async function downloadResolvedVideo(metadata: Record<string, unknown>, maxFileSizeMb: number, downloadDir: string, runner: DownloaderRunner, options: DownloadOptions, platform: string): Promise<DownloaderResult> {
   if (options.maxDurationSeconds && typeof metadata.duration === 'number' && metadata.duration > options.maxDurationSeconds) {
     throw new Error(`Video exceeds ${options.maxDurationSeconds} seconds`);
   }
@@ -180,7 +209,7 @@ async function downloadInstagramItem(metadata: Record<string, unknown>, maxFileS
     const infoPath = join(tempDir, 'source.info.json');
     const info: Record<string, unknown> = { ...metadata, _type: 'video' };
     // yt-dlp can re-extract webpage_url after a load-info-json download fails.
-    // For a collection entry that URL can name the whole parent post.
+    // A collection entry URL can name the whole post; any re-extraction can change identity.
     delete info.webpage_url;
     delete info.original_url;
     await writeFile(infoPath, JSON.stringify(info), { mode: 0o600 });
@@ -191,12 +220,12 @@ async function downloadInstagramItem(metadata: Record<string, unknown>, maxFileS
     ], options);
     const { stdout } = await runner('yt-dlp', args);
     const paths = stdout.trim().split(/\r?\n/).filter(Boolean);
-    if (paths.length !== 1) throw new Error('Expected exactly one Instagram video output');
+    if (paths.length !== 1) throw new Error(`Expected exactly one ${platform} video output`);
     const filePath = await realpath(paths[0]);
     const localPath = relative(await realpath(tempDir), filePath);
-    if (!localPath || localPath.startsWith('..') || isAbsolute(localPath)) throw new Error('Instagram output is outside its download directory');
+    if (!localPath || localPath.startsWith('..') || isAbsolute(localPath)) throw new Error(`${platform} output is outside its download directory`);
     const file = await stat(filePath);
-    if (!file.isFile() || !file.size) throw new Error('Instagram video output is empty or unavailable');
+    if (!file.isFile() || !file.size) throw new Error(`${platform} video output is empty or unavailable`);
     if (file.size > maxFileSizeMb * 1024 * 1024) throw new Error(`Downloaded file exceeds ${maxFileSizeMb} MB`);
     await rm(infoPath, { force: true });
     return { filePath, sizeBytes: file.size, tempDir };

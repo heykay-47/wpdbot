@@ -110,7 +110,7 @@ export function createWhatsappBot({ config, store, downloader, queue, runtimePat
       const sent = await client.sendMessage(groupId, media, { caption, waitUntilMsgSent: true });
       const id = messageId(sent);
       if (!id?.trim() || !sent?.fromMe || sent.to !== groupId || !Number.isInteger(sent.ack) || sent.ack < 1 || sent.ack > 4) {
-        throw new Error('Instagram repost acceptance is unknown');
+        throw new Error('Repost acceptance is unknown');
       }
       return { messageId: id, ack: sent.ack };
     },
@@ -250,7 +250,6 @@ async function handleWhatsappMessage(
     downloader,
     timezone: config.timezone,
     downloadDir: config.downloadDir,
-    nowMs: Date.now(),
     queue,
     logger: (entry) => console.error('Relay error', entry),
   });

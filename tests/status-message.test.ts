@@ -257,6 +257,7 @@ describe('createWhatsappBot', () => {
     const downloader = fakeDownloader();
     const { createWhatsappBot } = await import('../src/whatsapp');
     createWhatsappBot({ config: baseConfig(), store, downloader });
+    clients[0].sendMessage.mockResolvedValueOnce({ id: { _serialized: 'sent-1' }, ack: 1, fromMe: true, to: 'group-1@g.us' });
     const message = fakeMessage('', {
       links: [{ link: 'https://www.instagram.com/reel/DWJbfWGDBQg/', isSuspicious: false }],
     });
@@ -264,6 +265,10 @@ describe('createWhatsappBot', () => {
     await clients[0].handlers.get('message')?.(message);
 
     expect(downloader.download).toHaveBeenCalledWith('https://www.instagram.com/reel/DWJbfWGDBQg/', 64);
+    expect(store.confirmMediaRepost).toHaveBeenCalledWith(
+      { groupId: 'group-1@g.us', messageId: 'message-1', identity: { platform: 'instagram', postId: 'post-1', itemId: 'video-1' } },
+      { messageId: 'sent-1', ack: 1 }, expect.objectContaining({ url: 'https://www.instagram.com/reel/DWJbfWGDBQg/' }),
+    );
   });
 
   test('relayWhatsapp sends video, text, and deletes messages for everyone', async () => {
@@ -416,15 +421,23 @@ function fakeStore() {
     getInstagramItem: vi.fn(() => null),
     beginInstagramItem: vi.fn(() => true),
     confirmInstagramItem: vi.fn(),
+    getMediaDisposition: vi.fn(() => 'ready' as const),
+    beginMediaRepost: vi.fn(() => 'started' as const),
+    confirmMediaRepost: vi.fn(),
     countReposts: vi.fn(() => 0),
     close: vi.fn(),
   };
 }
 
 function fakeDownloader() {
-  const download = vi.fn(async (_url: string, _maxFileSizeMb: number) => ({ filePath: '/tmp/video.mp4', sizeBytes: 1 }));
+  const root = mkdtempSync(join(tmpdir(), 'wpdbot-whatsapp-download-test-'));
+  tempDirs.push(root);
+  const download = vi.fn(async (_url: string, _maxFileSizeMb: number) => ({ filePath: join(root, 'video.mp4'), sizeBytes: 1, tempDir: root }));
   return {
     download,
+    resolveYouTube: vi.fn(async (url: string) => ({
+      id: 'AbCdEf123_-', download: (maxFileSizeMb: number) => download(url, maxFileSizeMb),
+    })),
     resolveInstagram: vi.fn(async (url: string) => ({
       id: 'post-1', totalItems: 1,
       items: [{ id: 'video-1', index: 1, kind: 'video' as const, download: async (maxFileSizeMb: number) => ({ ...await download(url, maxFileSizeMb), tempDir: '/tmp/download-test' }) }],

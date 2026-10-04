@@ -6,7 +6,8 @@ import type { Downloader } from './downloader.js';
 import { messageForError, userError, type ErrorReportContext } from './errorReporter.js';
 import type { KeyedTaskQueue } from './keyedTaskQueue.js';
 import { extractFirstSupportedUrl, normalizeUrlForDuplicate } from './extractors.js';
-import type { RepostConfirmation, Store } from './store.js';
+import { candidateMediaIdentity, sourceRequestKey, type MediaIdentity } from './mediaIdentity.js';
+import type { MediaRepostKey, RepostConfirmation, Store } from './store.js';
 
 export type IncomingMessage = {
   id: string;
@@ -28,17 +29,19 @@ export type RelayWhatsapp = {
 
 export type RelayDownloader = {
   download(url: string, maxFileSizeMb: number): Promise<{ filePath: string; sizeBytes: number; tempDir?: string }>;
+  resolveYouTube: Downloader['resolveYouTube'];
   resolveInstagram: Downloader['resolveInstagram'];
 };
 
 export type HandleIncomingMessageInput = {
   message: IncomingMessage;
-  store: Pick<Store, 'getGroupSettings' | 'wasRecentlyPosted' | 'recordSuccessfulRepost' | 'recordDuplicate' | 'getInstagramItem' | 'beginInstagramItem' | 'confirmInstagramItem'>;
+  store: Pick<Store, 'getGroupSettings' | 'wasRecentlyPosted' | 'getMediaDisposition' | 'beginMediaRepost' | 'confirmMediaRepost'>;
   whatsapp: RelayWhatsapp;
   downloader: RelayDownloader;
   timezone: string;
   downloadDir?: string;
   nowMs?: number;
+  now?: () => number;
   cleanupPath?: (filePath: string) => Promise<void>;
   queue?: Pick<KeyedTaskQueue, 'run'>;
   logger?: (entry: Record<string, unknown>) => void;
@@ -87,17 +90,8 @@ export async function handleIncomingMessage(input: HandleIncomingMessageInput): 
   }
 }
 
-async function handleIncomingMessageCore({
-  message,
-  store,
-  whatsapp,
-  downloader,
-  timezone,
-  downloadDir,
-  nowMs = Date.now(),
-  cleanupPath,
-  queue,
-}: HandleIncomingMessageInput, errorContext: ErrorReportContext): Promise<void> {
+async function handleIncomingMessageCore(input: HandleIncomingMessageInput, errorContext: ErrorReportContext): Promise<void> {
+  const { message, store, queue } = input;
   if (!message.isGroup || message.fromMe) return;
 
   const supportedUrl = extractFirstSupportedUrl(message.body);
@@ -113,74 +107,56 @@ async function handleIncomingMessageCore({
   errorContext.urlHash = urlHash;
 
   errorContext.step = 'duplicate-check';
-  if (store.wasRecentlyPosted(message.groupId, urlHash, nowMs, settings.duplicateWindowHours)) return;
+  if (settings.duplicateWindowHours > 0 && store.wasRecentlyPosted(message.groupId, urlHash, processingNow(input), settings.duplicateWindowHours)) return;
 
   const runRelay = async () => {
+    const currentSettings = store.getGroupSettings(message.groupId);
+    if (!currentSettings.enabled) return;
     errorContext.step = 'duplicate-check';
-    if (store.wasRecentlyPosted(message.groupId, urlHash, nowMs, settings.duplicateWindowHours)) return;
+    if (currentSettings.duplicateWindowHours > 0 && store.wasRecentlyPosted(message.groupId, urlHash, processingNow(input), currentSettings.duplicateWindowHours)) return;
     if (supportedUrl.extractorId === 'instagram') {
-      await relayInstagram({ message, store, whatsapp, downloader, timezone, downloadDir, nowMs, cleanupPath }, supportedUrl.url, urlHash, errorContext);
+      await relayInstagram(input, supportedUrl.url, urlHash, errorContext);
       return;
     }
-    let download: Awaited<ReturnType<RelayDownloader['download']>>;
-
-    try {
-      errorContext.step = 'download';
-      download = await downloader.download(supportedUrl.url, settings.maxFileSizeMb);
-    } catch (error) {
-      throw userError(`Could not download this video: ${safeDownloadMessage(error)}`);
-    }
-
-    try {
-      try {
-        errorContext.step = 'upload';
-        await whatsapp.sendVideo(
-          message.groupId,
-          download.filePath,
-          formatCaption({
-            displayName: message.senderName,
-            timestampMs: message.timestampMs,
-            timezone,
-            originalUrl: supportedUrl.url,
-          }),
-        );
-      } catch {
-        throw userError('Could not upload this video: Upload failed.');
-      }
-
-      try {
-        errorContext.step = 'delete';
-        await whatsapp.deleteMessage(message.id);
-      } catch (error) {
-        messageForError(error, errorContext);
-        await whatsapp.sendText(message.groupId, 'Video posted, but I could not delete the original message.');
-      }
-
-      try {
-        errorContext.step = 'record';
-        store.recordSuccessfulRepost({
-          groupId: message.groupId,
-          senderId: message.senderId,
-          url: supportedUrl.url,
-          urlHash,
-          createdAtMs: nowMs,
-        });
-      } catch (error) {
-        messageForError(error, errorContext);
-        await whatsapp.sendText(message.groupId, 'Video posted, but repost history could not be saved.');
-      }
-    } finally {
-      await cleanupDownload(download, downloadDir, cleanupPath);
-    }
+    await relayYouTube(input, supportedUrl.url, urlHash, errorContext);
   };
 
-  const queueKey = `${message.groupId}:${urlHash}`;
+  const queueKey = JSON.stringify([message.groupId, sourceRequestKey(supportedUrl.url)]);
   if (queue) await queue.run(queueKey, runRelay);
   else await runRelay();
 }
 
+async function relayYouTube(input: HandleIncomingMessageInput, url: string, urlHash: string, errorContext: ErrorReportContext): Promise<void> {
+  const { message, store, downloader } = input;
+  if (!message.id.trim()) throw userError('YouTube relay needs a source message ID. Original message kept.');
+  const candidate = candidateMediaIdentity(url);
+  if (candidate) {
+    const progress = store.getMediaDisposition({ groupId: message.groupId, messageId: message.id, identity: candidate },
+      processingNow(input), store.getGroupSettings(message.groupId).duplicateWindowHours);
+    if (progress === 'completed' || progress === 'duplicate') return;
+    if (progress === 'held') throw unresolvedSendError('youtube');
+  }
+  errorContext.step = 'download';
+  const video = await downloader.resolveYouTube(url).catch(() => {
+    throw userError('Could not establish this YouTube video identity. Original message kept.');
+  });
+  const key = { groupId: message.groupId, messageId: message.id, identity: { platform: 'youtube' as const, videoId: video.id } };
+  errorContext.step = 'duplicate-check';
+  const progress = store.getMediaDisposition(key, processingNow(input), store.getGroupSettings(message.groupId).duplicateWindowHours);
+  if (progress === 'completed' || progress === 'duplicate') return;
+  if (progress === 'held') throw unresolvedSendError('youtube');
+  errorContext.step = 'download';
+  const download = await video.download(store.getGroupSettings(message.groupId).maxFileSizeMb).catch((error: unknown) => {
+    throw userError(`Could not download this video: ${safeDownloadMessage(error)} Original message kept.`);
+  });
+  await submitMedia(input, {
+    key, url, urlHash, download,
+    unknownMessage: 'YouTube delivery is unknown. No automatic retry. Original message kept.',
+  }, errorContext);
+}
+
 async function relayInstagram(input: HandleIncomingMessageInput, url: string, urlHash: string, errorContext: ErrorReportContext): Promise<void> {
-  const { message, store, whatsapp, downloader, timezone, downloadDir, cleanupPath, nowMs = Date.now() } = input;
+  const { message, store, whatsapp, downloader } = input;
   if (!message.id.trim()) throw userError('Instagram relay needs a source message ID. Original message kept.');
   errorContext.step = 'download';
   const source = await downloader.resolveInstagram(url).catch(() => {
@@ -196,11 +172,11 @@ async function relayInstagram(input: HandleIncomingMessageInput, url: string, ur
       continue;
     }
     hasVideo = true;
-    const key = { groupId: message.groupId, messageId: message.id, postId: source.id, itemId: item.id };
+    const key = { groupId: message.groupId, messageId: message.id, identity: { platform: 'instagram' as const, postId: source.id, itemId: item.id } };
     errorContext.step = 'record';
-    const progress = store.getInstagramItem(key);
-    if (progress?.status === 'confirmed') continue;
-    if (progress) throw userError('An Instagram video has an unresolved send. No automatic retry. Original message kept.');
+    const progress = store.getMediaDisposition(key, processingNow(input), store.getGroupSettings(message.groupId).duplicateWindowHours);
+    if (progress === 'completed' || progress === 'duplicate') continue;
+    if (progress === 'held') throw unresolvedSendError('instagram');
 
     let download: Awaited<ReturnType<RelayDownloader['download']>>;
     try {
@@ -214,37 +190,59 @@ async function relayInstagram(input: HandleIncomingMessageInput, url: string, ur
       continue;
     }
 
-    try {
-      if (!store.getGroupSettings(message.groupId).enabled) {
-        throw userError('Bot disabled. Remaining Instagram items were not reposted. Original message kept.');
-      }
-      errorContext.step = 'record';
-      if (!store.beginInstagramItem(key, nowMs)) {
-        if (store.getInstagramItem(key)?.status === 'confirmed') continue;
-        throw userError('An Instagram video has an unresolved send. No automatic retry. Original message kept.');
-      }
-      const caption = formatCaption({ displayName: message.senderName, timestampMs: message.timestampMs, timezone, originalUrl: url })
-        + (source.totalItems > 1 ? `\nInstagram item ${item.index} of ${source.totalItems}` : '');
-      errorContext.step = 'upload';
-      const confirmation = await whatsapp.sendVideoOnce(message.groupId, download.filePath, caption).catch(() => {
-        throw userError(`Instagram item ${item.index} delivery is unknown. No automatic retry. Original message kept.`);
-      });
-      errorContext.step = 'record';
-      store.confirmInstagramItem(key, confirmation, {
-        groupId: message.groupId, senderId: message.senderId, url, urlHash, createdAtMs: nowMs,
-      });
-    } finally {
-      await cleanupDownload(download, downloadDir, cleanupPath);
-    }
+    await submitMedia(input, {
+      key, url, urlHash, download,
+      captionSuffix: source.totalItems > 1 ? `\nInstagram item ${item.index} of ${source.totalItems}` : '',
+      unknownMessage: `Instagram item ${item.index} delivery is unknown. No automatic retry. Original message kept.`,
+    }, errorContext);
   }
 
-  if (complete && hasVideo) {
-    errorContext.step = 'record';
-    store.recordDuplicate(message.groupId, urlHash, nowMs);
-  }
   if (skippedItems || !complete || !hasVideo) {
     await whatsapp.sendText(message.groupId, hasVideo
       ? 'Photos or unresolved Instagram items were not reposted. Original message kept.'
       : 'No verifiable video in this Instagram post or selected item. Original message kept.');
   }
+}
+
+type MediaSubmission = {
+  key: MediaRepostKey;
+  url: string;
+  urlHash: string;
+  download: Awaited<ReturnType<RelayDownloader['download']>>;
+  captionSuffix?: string;
+  unknownMessage: string;
+};
+
+async function submitMedia(input: HandleIncomingMessageInput, submission: MediaSubmission, errorContext: ErrorReportContext): Promise<void> {
+  const { message, store, whatsapp, timezone, downloadDir, cleanupPath } = input;
+  const { key, url, urlHash, download, captionSuffix, unknownMessage } = submission;
+  try {
+    const settings = store.getGroupSettings(message.groupId);
+    if (!settings.enabled) throw userError(key.identity.platform === 'instagram'
+      ? 'Bot disabled. Remaining Instagram items were not reposted. Original message kept.'
+      : 'Bot disabled. Video was not reposted. Original message kept.');
+    const caption = formatCaption({ displayName: message.senderName, timestampMs: message.timestampMs, timezone, originalUrl: url }) + (captionSuffix ?? '');
+    errorContext.step = 'record';
+    const record = { groupId: message.groupId, senderId: message.senderId, url, urlHash, createdAtMs: processingNow(input) };
+    const reservation = store.beginMediaRepost(key, record, settings.duplicateWindowHours);
+    if (reservation === 'completed' || reservation === 'duplicate') return;
+    if (reservation === 'held') throw unresolvedSendError(key.identity.platform);
+    errorContext.step = 'upload';
+    const confirmation = await whatsapp.sendVideoOnce(message.groupId, download.filePath, caption).catch(() => {
+      throw userError(unknownMessage);
+    });
+    errorContext.step = 'record';
+    store.confirmMediaRepost(key, confirmation, { ...record, createdAtMs: processingNow(input) });
+  } finally {
+    await cleanupDownload(download, downloadDir, cleanupPath);
+  }
+}
+
+function unresolvedSendError(platform: MediaIdentity['platform']): Error {
+  const name = platform === 'instagram' ? 'An Instagram' : 'A YouTube';
+  return userError(`${name} video has an unresolved send. No automatic retry. Original message kept.`);
+}
+
+function processingNow(input: HandleIncomingMessageInput): number {
+  return input.now?.() ?? input.nowMs ?? Date.now();
 }
