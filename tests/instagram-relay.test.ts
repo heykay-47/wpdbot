@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDownloader } from '../src/downloader';
 import { handleIncomingMessage, type IncomingMessage } from '../src/relay';
 import { createStore, type Store } from '../src/store';
+import { videoProbeJson } from './fixtures/media';
 
 const roots: string[] = [];
 const stores: Store[] = [];
@@ -42,6 +43,7 @@ async function fixture(sourceMetadata: unknown = metadata, failDownloads = new S
   const downloader = createDownloader({
     downloadDir: join(root, 'downloads'),
     runner: async (_file, args) => {
+      if (_file === 'ffprobe') return { stdout: videoProbeJson };
       if (args.includes('--dump-single-json')) {
         inspectedUrls.push(args.at(-1)!);
         return { stdout: JSON.stringify(sourceMetadata) };

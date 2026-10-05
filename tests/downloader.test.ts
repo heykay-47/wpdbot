@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createDownloader, type DownloaderRunner } from '../src/downloader';
+import { videoProbeJson } from './fixtures/media';
 
 let tempDirs: string[] = [];
 
@@ -20,10 +21,29 @@ afterEach(() => {
 });
 
 describe('createDownloader', () => {
+  it('applies the operator ceiling and probes a frozen video before returning it', async () => {
+    const root = createTempDir();
+    const calls: string[] = [];
+    const runner: DownloaderRunner = async (file, args) => {
+      calls.push(file);
+      if (file === 'ffprobe') return { stdout: JSON.stringify({ format: { format_name: 'mp4', duration: '10', tags: { major_brand: 'isom' } }, streams: [
+        { codec_type: 'video', codec_name: 'h264', width: 640, height: 360, pix_fmt: 'yuv420p', avg_frame_rate: '25/1' },
+      ] }) };
+      if (args.includes('--dump-single-json')) return { stdout: JSON.stringify({ id: 'AbCdEf123_-', extractor_key: 'Youtube', formats: [{ url: 'https://media.example/video.mp4', ext: 'mp4' }] }) };
+      expect(args[args.indexOf('--max-filesize') + 1]).toBe('1M');
+      const path = join(dirname(args[args.indexOf('--load-info-json') + 1]), 'video.mp4');
+      writeFileSync(path, 'video');
+      return { stdout: path };
+    };
+    const video = await createDownloader({ downloadDir: root, runner, options: { maxMediaSizeMb: 1 } }).resolveYouTube('https://youtube.com/shorts/AbCdEf123_-');
+    expect(await video.download(128)).toMatchObject({ deliveryMode: 'video', sizeBytes: 5 });
+    expect(calls).toEqual(['yt-dlp', 'yt-dlp', 'ffprobe']);
+  });
   it('resolves a YouTube video identity and downloads that frozen video rather than re-extracting the source URL', async () => {
     const root = createTempDir();
     let infoPath = '';
     const runner: DownloaderRunner = async (_file, args) => {
+      if (_file === 'ffprobe') return { stdout: videoProbeJson };
       if (args.includes('--dump-single-json')) {
         expect(args).not.toContain('--ignore-config');
         return { stdout: JSON.stringify({
@@ -163,6 +183,7 @@ describe('createDownloader', () => {
     const root = createTempDir();
     let infoPath = '';
     const runner: DownloaderRunner = async (_file, args) => {
+      if (_file === 'ffprobe') return { stdout: videoProbeJson };
       if (args.includes('--dump-single-json')) return { stdout: JSON.stringify({
         extractor_key: 'Instagram', _type: 'playlist', id: 'post-1', entries: [
           { id: 'video-1', webpage_url: 'https://www.instagram.com/p/example/', formats: [{ url: 'https://media.example/one.mp4', ext: 'mp4' }] },
@@ -238,6 +259,7 @@ describe('createDownloader', () => {
   it('checks the duration of each Instagram video before downloading that item', async () => {
     const calls: Parameters<DownloaderRunner>[] = [];
     const runner: DownloaderRunner = async (...args) => {
+      if (args[0] === 'ffprobe') return { stdout: videoProbeJson };
       calls.push(args);
       return { stdout: JSON.stringify({ extractor_key: 'Instagram', _type: 'playlist', id: 'post-1', entries: [
         { id: 'long-video', duration: 121, formats: [{ url: 'https://media.example/long.mp4', ext: 'mp4' }] },
@@ -257,6 +279,7 @@ describe('createDownloader', () => {
     let filePath = '';
     const calls: Parameters<DownloaderRunner>[] = [];
     const runner: DownloaderRunner = async (...args) => {
+      if (args[0] === 'ffprobe') return { stdout: videoProbeJson };
       calls.push(args);
       const outputTemplate = args[1][args[1].indexOf('--output') + 1];
       filePath = join(dirname(outputTemplate), 'video.mp4');
@@ -267,14 +290,14 @@ describe('createDownloader', () => {
 
     const result = await createDownloader({ downloadDir, runner }).download('https://www.youtube.com/shorts/example', 1);
 
-    expect(result).toEqual({ filePath, sizeBytes: 1024, tempDir: dirname(filePath) });
+    expect(result).toEqual({ filePath, sizeBytes: 1024, tempDir: dirname(filePath), deliveryMode: 'video' });
     expect(calls).toEqual([
       [
         'yt-dlp',
         [
           '--no-playlist',
           '--format',
-          'bv*[ext=mp4][vcodec^=avc1][height<=1280]+ba[ext=m4a]/b[ext=mp4][vcodec^=avc1][height<=1280]/bv*[ext=mp4][height<=1280]+ba[ext=m4a]/b[ext=mp4][height<=1280]/best[height<=1280]/best',
+          expect.stringContaining('[width<=?720]'),
           '--merge-output-format',
           'mp4',
           '--max-filesize',
@@ -294,6 +317,7 @@ describe('createDownloader', () => {
     const downloadDir = join(createTempDir(), 'downloads');
     const outputDirs: string[] = [];
     const runner: DownloaderRunner = async (_file, args) => {
+      if (_file === 'ffprobe') return { stdout: videoProbeJson };
       const outputTemplate = args[args.indexOf('--output') + 1];
       const outputDir = dirname(outputTemplate);
       const filePath = join(outputDir, 'video.mp4');
@@ -383,6 +407,7 @@ describe('createDownloader', () => {
     const downloadDir = join(createTempDir(), 'downloads');
     const calls: Parameters<DownloaderRunner>[] = [];
     const runner: DownloaderRunner = async (...args) => {
+      if (args[0] === 'ffprobe') return { stdout: videoProbeJson };
       calls.push(args);
       const outputTemplate = args[1][args[1].indexOf('--output') + 1];
       const filePath = join(dirname(outputTemplate), 'video.mp4');

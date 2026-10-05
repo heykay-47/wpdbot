@@ -3,6 +3,7 @@ export type AppConfig = {
   sqlitePath: string;
   timezone: string;
   maxFileSizeMb: number;
+  maxMediaSizeMb: number;
   duplicateWindowHours: number;
   downloadDir: string;
   maxDurationSeconds?: number;
@@ -18,7 +19,7 @@ function readPositiveInteger(env: NodeJS.ProcessEnv, key: string, fallback?: num
   if (raw === undefined || raw.trim() === '') return fallback;
 
   const value = Number(raw);
-  if (!Number.isInteger(value) || value <= 0) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error(`${key} must be a positive integer`);
   }
 
@@ -42,6 +43,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     sqlitePath: readRequired(env, 'SQLITE_PATH'),
     timezone: env.TIMEZONE?.trim() || 'Asia/Kolkata',
     maxFileSizeMb: readPositiveInteger(env, 'MAX_FILE_SIZE_MB', 64),
+    maxMediaSizeMb: readPositiveInteger(env, 'MAX_MEDIA_SIZE_MB', 64),
     duplicateWindowHours: readPositiveInteger(env, 'DUPLICATE_WINDOW_HOURS', 24),
     downloadDir: env.DOWNLOAD_DIR?.trim() || '/tmp/wpdbot-downloads',
     maxDurationSeconds: readPositiveInteger(env, 'MAX_DURATION_SECONDS'),

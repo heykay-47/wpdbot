@@ -2,10 +2,11 @@ import { mkdir, mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, relative } from 'node:path';
 import { execa } from 'execa';
 import { candidateMediaIdentity, isYouTubeVideoId } from './mediaIdentity.js';
+import { prepareMedia } from './mediaPreparation.js';
 
-export type DownloaderRunner = (file: string, args: string[]) => Promise<{ stdout: string }>;
+export type DownloaderRunner = (file: string, args: string[], timeoutMs?: number) => Promise<{ stdout: string }>;
 
-export type DownloaderResult = { filePath: string; sizeBytes: number; tempDir: string };
+export type DownloaderResult = { filePath: string; sizeBytes: number; tempDir: string; deliveryMode?: 'video' | 'document' };
 export type YouTubeVideo = { id: string; download(maxFileSizeMb: number): Promise<DownloaderResult> };
 
 export type InstagramItem = {
@@ -25,6 +26,7 @@ export type DownloadOptions = {
   cookiesPath?: string;
   proxy?: string;
   maxDurationSeconds?: number;
+  maxMediaSizeMb?: number;
 };
 
 export type Downloader = {
@@ -39,8 +41,8 @@ type DownloaderOptions = {
   options?: DownloadOptions;
 };
 
-const defaultRunner: DownloaderRunner = async (file, args) => execa(file, args);
-const videoFormat = 'bv*[ext=mp4][vcodec^=avc1][height<=1280]+ba[ext=m4a]/b[ext=mp4][vcodec^=avc1][height<=1280]/bv*[ext=mp4][height<=1280]+ba[ext=m4a]/b[ext=mp4][height<=1280]/best[height<=1280]/best';
+const defaultRunner: DownloaderRunner = async (file, args, timeoutMs = 300_000) => execa(file, args, { timeout: timeoutMs, forceKillAfterDelay: 1000 });
+const videoFormat = 'bv*[ext=mp4][vcodec^=avc1][width<=?720][fps<=?30]+ba[acodec^=mp4a]/bv*[ext=mp4][vcodec^=avc1][height<=?720][fps<=?30]+ba[acodec^=mp4a]/b[ext=mp4][vcodec^=avc1][width<=?720][fps<=?30]/b[ext=mp4][vcodec^=avc1][height<=?720][fps<=?30]/bv*[width<=?720]+ba/bv*[height<=?720]+ba/best[width<=?720]/best[height<=?720]';
 
 function appendSharedArgs(args: string[], options: DownloadOptions): string[] {
   if (options.cookiesPath) args.push('--cookies', options.cookiesPath);
@@ -151,6 +153,7 @@ export function createDownloader({ downloadDir, runner = defaultRunner, options 
     },
 
     async download(url, maxFileSizeMb) {
+      maxFileSizeMb = Math.min(maxFileSizeMb, options.maxMediaSizeMb ?? 64);
       await assertDurationAllowed(runner, url, options);
       await mkdir(downloadDir, { recursive: true });
       const tempDir = await mkdtemp(join(downloadDir, 'download-'));
@@ -179,7 +182,8 @@ export function createDownloader({ downloadDir, runner = defaultRunner, options 
           throw new Error(`Downloaded file exceeds ${maxFileSizeMb} MB`);
         }
 
-        return { filePath, sizeBytes: size, tempDir };
+        const prepared = await prepareMedia(filePath, maxFileSizeMb, runner, options.maxDurationSeconds);
+        return { ...prepared, tempDir };
       } catch (error) {
         await rm(tempDir, { force: true, recursive: true }).catch(() => undefined);
         throw error;
@@ -199,6 +203,7 @@ function hasVideoFormats(metadata: Record<string, unknown>): boolean {
 }
 
 async function downloadResolvedVideo(metadata: Record<string, unknown>, maxFileSizeMb: number, downloadDir: string, runner: DownloaderRunner, options: DownloadOptions, platform: string): Promise<DownloaderResult> {
+  maxFileSizeMb = Math.min(maxFileSizeMb, options.maxMediaSizeMb ?? 64);
   if (options.maxDurationSeconds && typeof metadata.duration === 'number' && metadata.duration > options.maxDurationSeconds) {
     throw new Error(`Video exceeds ${options.maxDurationSeconds} seconds`);
   }
@@ -228,7 +233,8 @@ async function downloadResolvedVideo(metadata: Record<string, unknown>, maxFileS
     if (!file.isFile() || !file.size) throw new Error(`${platform} video output is empty or unavailable`);
     if (file.size > maxFileSizeMb * 1024 * 1024) throw new Error(`Downloaded file exceeds ${maxFileSizeMb} MB`);
     await rm(infoPath, { force: true });
-    return { filePath, sizeBytes: file.size, tempDir };
+    const prepared = await prepareMedia(filePath, maxFileSizeMb, runner, options.maxDurationSeconds);
+    return { ...prepared, tempDir };
   } catch (error) {
     await rm(tempDir, { force: true, recursive: true }).catch(() => undefined);
     throw error;

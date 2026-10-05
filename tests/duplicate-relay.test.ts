@@ -8,6 +8,7 @@ import { createDownloader } from '../src/downloader';
 import { KeyedTaskQueue } from '../src/keyedTaskQueue';
 import { handleIncomingMessage, type IncomingMessage } from '../src/relay';
 import { createStore, type Store, type StoreDefaults } from '../src/store';
+import { videoProbeJson } from './fixtures/media';
 
 const stores: Store[] = [];
 const roots: string[] = [];
@@ -36,6 +37,7 @@ async function fixture(defaults: StoreDefaults = {}) {
   const downloadedPaths: string[] = [];
   const failures = { inspection: false, download: false };
   const downloader = createDownloader({ downloadDir: join(root, 'downloads'), runner: async (_file, args) => {
+    if (_file === 'ffprobe') return { stdout: videoProbeJson };
     if (args.includes('--dump-single-json')) {
       inspectedUrls.push(args.at(-1)!);
       if (failures.inspection) throw new Error('Inspection unavailable');

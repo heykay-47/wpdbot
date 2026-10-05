@@ -1,8 +1,5 @@
-import { rm } from 'node:fs/promises';
-import { dirname, extname, join, basename } from 'node:path';
 import qrcode from 'qrcode-terminal';
 import whatsappWeb from 'whatsapp-web.js';
-import { execa } from 'execa';
 import { canManageGroup, parseCommand } from './commands.js';
 import { messageForError } from './errorReporter.js';
 import { KeyedTaskQueue } from './keyedTaskQueue.js';
@@ -22,7 +19,7 @@ export type StatusInput = {
 
 export type WhatsappRelay = {
   sendVideo(groupId: string, filePath: string, caption: string): Promise<string>;
-  sendVideoOnce(groupId: string, filePath: string, caption: string): Promise<RepostConfirmation>;
+  sendVideoOnce(groupId: string, filePath: string, caption: string, deliveryMode?: 'document'): Promise<RepostConfirmation>;
   deleteMessage(groupId: string, messageId: string): Promise<void>;
   sendText(groupId: string, text: string): Promise<void>;
 };
@@ -105,9 +102,9 @@ export function createWhatsappBot({ config, store, downloader, queue, runtimePat
   });
 
   const relayWhatsapp: WhatsappRelay = {
-    async sendVideoOnce(groupId, filePath, caption) {
+    async sendVideoOnce(groupId, filePath, caption, deliveryMode) {
       const media = MessageMedia.fromFilePath(filePath);
-      const sent = await client.sendMessage(groupId, media, { caption, waitUntilMsgSent: true });
+      const sent = await client.sendMessage(groupId, media, { caption, waitUntilMsgSent: true, ...(deliveryMode === 'document' ? { sendMediaAsDocument: true } : {}) });
       const id = messageId(sent);
       if (!id?.trim() || !sent?.fromMe || sent.to !== groupId || !Number.isInteger(sent.ack) || sent.ack < 1 || sent.ack > 4) {
         throw new Error('Repost acceptance is unknown');
@@ -117,30 +114,7 @@ export function createWhatsappBot({ config, store, downloader, queue, runtimePat
 
     async sendVideo(groupId, filePath, caption) {
       const media = MessageMedia.fromFilePath(filePath);
-      let sent: Awaited<ReturnType<typeof client.sendMessage>>;
-      let transcodedPath: string | null = null;
-
-      try {
-        sent = await client.sendMessage(groupId, media, { caption });
-      } catch (error) {
-        logSanitizedError('Video upload failed; retrying after WhatsApp transcode', error, 'whatsapp-upload');
-
-        try {
-          transcodedPath = await transcodeForWhatsapp(filePath);
-          sent = await client.sendMessage(groupId, MessageMedia.fromFilePath(transcodedPath), { caption });
-        } catch (transcodeOrUploadError) {
-          if (isBrowserTargetClosedError(transcodeOrUploadError)) {
-            logSanitizedError('Transcoded video upload failed; browser target closed', transcodeOrUploadError, 'whatsapp-transcode-upload');
-            throw transcodeOrUploadError;
-          }
-
-          logSanitizedError('Transcoded video upload failed; retrying as document', transcodeOrUploadError, 'whatsapp-transcode-upload');
-          sent = await client.sendMessage(groupId, media, { caption, sendMediaAsDocument: true });
-        } finally {
-          if (transcodedPath) await rm(transcodedPath, { force: true }).catch(() => undefined);
-        }
-      }
-
+      const sent = await client.sendMessage(groupId, media, { caption });
       return messageId(sent) ?? '';
     },
 
@@ -232,7 +206,7 @@ async function handleWhatsappMessage(
     }
 
     const settings = store.getGroupSettings(groupId);
-    await message.reply(formatStatus({ ...settings, botIsAdmin }));
+    await message.reply(formatStatus({ ...settings, maxFileSizeMb: Math.min(settings.maxFileSizeMb, config.maxMediaSizeMb ?? 64), botIsAdmin }));
     return;
   }
 
@@ -250,6 +224,7 @@ async function handleWhatsappMessage(
     downloader,
     timezone: config.timezone,
     downloadDir: config.downloadDir,
+    maxMediaSizeMb: config.maxMediaSizeMb,
     queue,
     logger: (entry) => console.error('Relay error', entry),
   });
@@ -340,53 +315,4 @@ function addIdCandidate(candidates: Set<string>, value: string | null | undefine
     candidates.add(`${trimmed}@c.us`);
     candidates.add(`${trimmed}@lid`);
   }
-}
-
-function isBrowserTargetClosedError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.includes('Target closed') || message.includes('detached Frame');
-}
-
-async function transcodeForWhatsapp(filePath: string): Promise<string> {
-  const extension = extname(filePath);
-  const baseName = basename(filePath, extension);
-  const outputPath = join(dirname(filePath), `${baseName}.whatsapp.mp4`);
-
-  try {
-    await execa('ffmpeg', [
-      '-y',
-      '-i',
-      filePath,
-      '-vf',
-      'scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2',
-      '-c:v',
-      'libx264',
-      '-preset',
-      'veryfast',
-      '-crf',
-      '28',
-      '-maxrate',
-      '1400k',
-      '-bufsize',
-      '2800k',
-      '-pix_fmt',
-      'yuv420p',
-      '-profile:v',
-      'baseline',
-      '-level',
-      '3.1',
-      '-c:a',
-      'aac',
-      '-b:a',
-      '128k',
-      '-movflags',
-      '+faststart',
-      outputPath,
-    ]);
-  } catch (error) {
-    await rm(outputPath, { force: true }).catch(() => undefined);
-    throw error;
-  }
-
-  return outputPath;
 }

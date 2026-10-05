@@ -21,6 +21,7 @@ export function main(): void {
       cookiesPath: config.ytDlpCookiesPath,
       proxy: config.ytDlpProxy,
       maxDurationSeconds: config.maxDurationSeconds,
+      maxMediaSizeMb: config.maxMediaSizeMb,
     },
   });
   const queue = new KeyedTaskQueue(config.concurrentDownloads);

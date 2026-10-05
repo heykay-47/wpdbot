@@ -19,9 +19,9 @@ WhatsApp group media relay bot for personal use. It watches enabled WhatsApp gro
 - Instagram video identities use the resolved parent-post and video-item IDs. Sharing item 3, then the whole collection, reposts only its other unconfirmed videos inside the window. Sharing the whole collection, then item 3, does not repost that video again inside the window. `/p/` versus `/reel/` alone does not identify one equal video.
 - Arbitrary queries, encoded/malformed IDs, unusual paths, long shortcode variants, and mobile Instagram links do not receive guessed equivalence. The submitted URL is kept for extraction and attribution. Verified metadata may establish an identity; otherwise no video is sent and the source remains visible. Fixture success does not prove mobile Instagram extraction works in a deployment.
 - A group's duplicate window starts when a repost's confirmation is observed, not when its source was posted or queued. Duplicate skips do not extend it. A new source message may request another repost after expiry. Confirmed outcomes for the same source message remain completed even after expiry or restart. Queued work rechecks current settings and time.
-- Both platforms use one submission attempt without automatic transcode or document retries. Confirmation requires a sent-message ID and an observed server-or-stronger acknowledgement in the originating group. It does not prove every participant received the repost.
+- Both platforms prepare media before making one submission attempt. There are no transcode or document retries after submission begins. Confirmation requires a sent-message ID and an observed server-or-stronger acknowledgement in the originating group. It does not prove every participant received the repost.
 - Identity-based send reservations are stored before submission. An unresolved send blocks that video across source messages and restarts, regardless of duplicate-window expiry. A definite inspection/download failure does not create a confirmed duplicate marker. A submitted video whose confirmation cannot be recorded remains held rather than being sent again.
-- All source messages remain intact, including duplicate-only and mixed new/duplicate requests. General reconciliation, authorized retry commands, media fallbacks, and guarded source cleanup remain later work. Do not erase progress records to force another send.
+- All source messages remain intact, including document reposts, duplicate-only and mixed new/duplicate requests. General reconciliation, authorized retry commands, and guarded source cleanup remain later work. Do not erase progress records to force another send.
 
 SQLite initialization adds `media_relay_attempts` without rewriting existing settings, history, URL hashes, or `instagram_relay_items`. Legacy URL markers still suppress only their exact legacy-normalized URL in the same group/window; they are not promoted to ACK-confirmed identities or broadened to aliases. Old Instagram confirmations still protect the same source message, and old unresolved items protect the same resolved video across messages. Old records have no reliable confirmation timestamp, so no canonical windows are backfilled. A newly encountered URL alias can therefore be reposted despite an old URL-only marker.
 
@@ -31,11 +31,22 @@ A zero-hour stored group window disables prior-message confirmed suppression, no
 
 - A post with several videos reposts each verifiable video in post order. Photos and entries without reliable video metadata are not reposted.
 - A source link with `img_index=3` requests only the third media item, counting photos as positions too. An invalid, unavailable, or non-video selection does not fall back to another video.
-- A failed item download does not prevent other verifiable videos from being processed. Each downloaded video must meet the configured file-size limit; configured duration checks apply to each item's available metadata.
+- A failed item download or media preparation does not prevent other verifiable videos from being processed. Each video must meet the effective media budget; configured duration limits also apply to the probed final file.
 - Instagram source messages are always retained, including fully reposted single-video posts. Safe automatic cleanup awaits the remaining restart-recovery and deletion-guard work.
 - Unresolved sends stop the collection. There is no automatic reconciliation or recovery command yet. Do not erase progress records to force a retry; review the group first because the video may already be present.
 
 Metadata handling is conservative when yt-dlp omits entries or cannot establish their positions. Its deployed version is not pinned by this project, so fixture-based checks do not replace a separately authorized private-group smoke test.
+
+### Media quality and pre-send fallbacks
+
+- Prefer MP4/H.264 with AAC audio when present, a short edge of at most 720 pixels and at most 30 fps. Silent video is allowed. Selection keeps bounded resolution alternatives; missing upstream dimensions may proceed to local probing. No unrestricted highest-resolution fallback or repeated lower-quality download loop exists.
+- Validate final filesystem bytes and use `ffprobe` for streams, dimensions, pixel format, frame rate and duration. Inline MP4 eligibility also requires a recognized MP4-family major brand and an MP4 filename for MIME selection. FFprobe's shared MOV/MP4 demuxer name alone is insufficient; unknown brands require preparation or document delivery. Probe success is not a full-frame decode test or a promise of recipient playback.
+- Within-budget media that already meets the profile is sent without re-encoding. Otherwise attempt one full-video conversion using libx264, yuv420p, CRF 28, veryfast, AAC 128k and faststart. Scale down only, preserve aspect ratio with even dimensions, cap frame rate, and use two encoder/filter threads. There is no fixed H.264 level claim, trimming, byte-target guarantee or repeated compression loop.
+- Recheck converted size, profile and duration before selecting it. A duration difference greater than 0.25 seconds rejects that conversion. If conversion fails, times out, is oversized or fails validation, select the validated original as a document under the same byte and duration budgets. Unknown original duration with no configured duration limit permits document delivery without conversion, since conversion completeness cannot be checked.
+- Empty, oversized or unprobeable originals are not sent as videos or documents. Missing upstream size/duration is not treated as zero. Duration evidence must cover the container or every video stream; audio-only duration cannot establish the video's duration. With `MAX_DURATION_SECONDS` configured, an unavailable final duration prevents sending. Without it, unknown duration remains allowed for a valid original.
+- Each yt-dlp subprocess has a five-minute timeout, conversion two minutes, and each probe 30 seconds. Metadata inspection and downloading are separate calls. These plus existing concurrency settings bound processing, but temporary components, muxing and base64/browser copies can exceed the final file budget. No hard disk or process-memory quota is claimed.
+- The effective budget is `min(stored group limit, MAX_MEDIA_SIZE_MB)`, measured in MiB, for both videos and documents. Existing stored limits are not rewritten. Recheck actual bytes against current settings before the send reservation. Status reports the effective limit using the existing MB label.
+- Document delivery is chosen before any submission, preserves attribution and retains the source. It does not guarantee playback. After a submitted video/document throws or lacks confirmation, hold its identity without automatically resubmitting in another mode. The legacy send adapter also no longer retries exceptions.
 
 ## Important Notes
 
@@ -75,7 +86,8 @@ Node 24 is the supported runtime for local development and Docker. Node 20 is no
    BOT_OWNER_ID=919999999999@c.us
    SQLITE_PATH=/data/bot.db
    TIMEZONE=Asia/Kolkata
-   MAX_FILE_SIZE_MB=64
+    MAX_FILE_SIZE_MB=64
+    MAX_MEDIA_SIZE_MB=64
    DUPLICATE_WINDOW_HOURS=24
    DOWNLOAD_DIR=/tmp/wpdbot-downloads
    MAX_DURATION_SECONDS=
@@ -113,12 +125,13 @@ Configure the bot with `.env`.
 | `BOT_OWNER_ID` | `919999999999@c.us` | WhatsApp ID allowed to manage the bot in any group. Replace with your number. |
 | `SQLITE_PATH` | `./data/bot.db` | SQLite database path. Docker Compose overrides this to `/data/bot.db`. |
 | `TIMEZONE` | `Asia/Kolkata` | Timezone used in repost captions. |
-| `MAX_FILE_SIZE_MB` | `64` | Maximum downloaded file size per relay. |
+| `MAX_FILE_SIZE_MB` | `64` | Initial per-video group budget in MiB for new groups. Existing stored group limits are preserved. |
+| `MAX_MEDIA_SIZE_MB` | `64` | Operator-wide ceiling in MiB, applied to video and document downloads/final files. Effective limit is the smaller of this ceiling and the stored group budget. This is an application budget, not a guaranteed WhatsApp limit. |
 | `DUPLICATE_WINDOW_HOURS` | `24` | Initial positive duplicate window for new groups, measured from observed confirmation. Existing group settings are preserved. |
 | `DOWNLOAD_DIR` | `/tmp/wpdbot-downloads` | Temporary download directory. |
 | `WHATSAPP_AUTH_DIR` | Docker: `/app/.wwebjs_auth` | Optional WhatsApp auth directory override. Usually leave unset outside Docker. |
 | `WHATSAPP_CACHE_DIR` | Docker: `/app/.wwebjs_cache` | Optional WhatsApp cache directory override. Usually leave unset outside Docker. |
-| `MAX_DURATION_SECONDS` | empty | Optional maximum video duration in seconds. Leave empty to disable duration checks. |
+| `MAX_DURATION_SECONDS` | empty | Optional global maximum video duration in seconds, checked against known metadata and the probed final file. Unknown final duration rejects when configured. Leave empty to disable the limit. |
 | `YT_DLP_COOKIES_PATH` | empty | Optional path to a private Netscape cookies file for authenticated `yt-dlp` downloads. Never commit this file; mount it as a secret/volume and do not `COPY` it into a Docker image. |
 | `YT_DLP_PROXY` | empty | Optional proxy URL passed to `yt-dlp` for network or region workarounds. |
 | `CONCURRENT_DOWNLOADS` | `1` | Maximum concurrent active downloads. Keep `1` for personal reliability. |

@@ -12,6 +12,7 @@ describe('loadConfig', () => {
     expect(config.sqlitePath).toBe('/data/bot.db');
     expect(config.timezone).toBe('Asia/Kolkata');
     expect(config.maxFileSizeMb).toBe(64);
+    expect(config.maxMediaSizeMb).toBe(64);
     expect(config.duplicateWindowHours).toBe(24);
     expect(config.downloadDir).toBe('/tmp/wpdbot-downloads');
   });
@@ -37,15 +38,17 @@ describe('loadConfig', () => {
       YT_DLP_COOKIES_PATH: '/run/secrets/cookies.txt',
       YT_DLP_PROXY: 'socks5://127.0.0.1:9050',
       CONCURRENT_DOWNLOADS: '2',
+      MAX_MEDIA_SIZE_MB: '32',
     });
 
     expect(config.maxDurationSeconds).toBe(120);
     expect(config.ytDlpCookiesPath).toBe('/run/secrets/cookies.txt');
     expect(config.ytDlpProxy).toBe('socks5://127.0.0.1:9050');
     expect(config.concurrentDownloads).toBe(2);
+    expect(config.maxMediaSizeMb).toBe(32);
   });
 
-  it.each(['MAX_FILE_SIZE_MB', 'DUPLICATE_WINDOW_HOURS', 'CONCURRENT_DOWNLOADS', 'MAX_DURATION_SECONDS'])(
+  it.each(['MAX_FILE_SIZE_MB', 'MAX_MEDIA_SIZE_MB', 'DUPLICATE_WINDOW_HOURS', 'CONCURRENT_DOWNLOADS', 'MAX_DURATION_SECONDS'])(
     'rejects invalid positive integers for %s', (key) => {
       for (const value of ['0', '-1', '1.5', 'invalid']) {
         expect(() => loadConfig({

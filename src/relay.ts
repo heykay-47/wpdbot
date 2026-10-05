@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { rm } from 'node:fs/promises';
+import { rm, stat } from 'node:fs/promises';
 import { basename, dirname, relative, resolve } from 'node:path';
 import { formatCaption } from './caption.js';
 import type { Downloader } from './downloader.js';
@@ -22,13 +22,13 @@ export type IncomingMessage = {
 
 export type RelayWhatsapp = {
   sendVideo(groupId: string, filePath: string, caption: string): Promise<void>;
-  sendVideoOnce(groupId: string, filePath: string, caption: string): Promise<RepostConfirmation>;
+  sendVideoOnce(groupId: string, filePath: string, caption: string, deliveryMode?: 'document'): Promise<RepostConfirmation>;
   sendText(groupId: string, text: string): Promise<void>;
   deleteMessage(messageId: string): Promise<void>;
 };
 
 export type RelayDownloader = {
-  download(url: string, maxFileSizeMb: number): Promise<{ filePath: string; sizeBytes: number; tempDir?: string }>;
+  download(url: string, maxFileSizeMb: number): Promise<{ filePath: string; sizeBytes: number; tempDir?: string; deliveryMode?: 'video' | 'document' }>;
   resolveYouTube: Downloader['resolveYouTube'];
   resolveInstagram: Downloader['resolveInstagram'];
 };
@@ -40,6 +40,7 @@ export type HandleIncomingMessageInput = {
   downloader: RelayDownloader;
   timezone: string;
   downloadDir?: string;
+  maxMediaSizeMb?: number;
   nowMs?: number;
   now?: () => number;
   cleanupPath?: (filePath: string) => Promise<void>;
@@ -222,13 +223,20 @@ async function submitMedia(input: HandleIncomingMessageInput, submission: MediaS
       ? 'Bot disabled. Remaining Instagram items were not reposted. Original message kept.'
       : 'Bot disabled. Video was not reposted. Original message kept.');
     const caption = formatCaption({ displayName: message.senderName, timestampMs: message.timestampMs, timezone, originalUrl: url }) + (captionSuffix ?? '');
+    const limit = Math.min(settings.maxFileSizeMb, input.maxMediaSizeMb ?? 64);
+    const file = await stat(download.filePath);
+    if (!Number.isSafeInteger(limit) || limit <= 0 || !file.isFile() || file.size === 0 || file.size > limit * 1024 * 1024) {
+      throw userError('Video no longer meets the current media size limit. Original message kept.');
+    }
     errorContext.step = 'record';
     const record = { groupId: message.groupId, senderId: message.senderId, url, urlHash, createdAtMs: processingNow(input) };
     const reservation = store.beginMediaRepost(key, record, settings.duplicateWindowHours);
     if (reservation === 'completed' || reservation === 'duplicate') return;
     if (reservation === 'held') throw unresolvedSendError(key.identity.platform);
     errorContext.step = 'upload';
-    const confirmation = await whatsapp.sendVideoOnce(message.groupId, download.filePath, caption).catch(() => {
+    const confirmation = await (download.deliveryMode === 'document'
+      ? whatsapp.sendVideoOnce(message.groupId, download.filePath, caption, 'document')
+      : whatsapp.sendVideoOnce(message.groupId, download.filePath, caption)).catch(() => {
       throw userError(unknownMessage);
     });
     errorContext.step = 'record';

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDownloader } from '../src/downloader';
 import { handleIncomingMessage, type IncomingMessage } from '../src/relay';
 import { createStore, type Store } from '../src/store';
+import { videoProbeJson } from './fixtures/media';
 
 const baseMessage: IncomingMessage = {
   id: 'message-1', groupId: 'group-1@g.us', senderId: 'sender@c.us', senderName: 'Mom',
@@ -34,6 +35,7 @@ async function fixture(platform: 'youtube' | 'instagram' = 'youtube') {
   const failures = { inspection: false, download: false };
   const downloadDir = join(root, 'downloads');
   const downloader = createDownloader({ downloadDir, runner: async (_file, args) => {
+    if (_file === 'ffprobe') return { stdout: videoProbeJson };
     if (args.includes('--dump-single-json')) {
       inspectedUrls.push(args.at(-1)!);
       if (failures.inspection) throw new Error('private upstream response');
@@ -72,6 +74,43 @@ describe('handleIncomingMessage', () => {
     expect(input.whatsapp.sendVideo).not.toHaveBeenCalled();
     expect(input.whatsapp.deleteMessage).not.toHaveBeenCalled();
     expect(input.store.countReposts()).toBe(1);
+  });
+
+  it('submits a preselected document once and holds an ambiguous outcome without any fallback send', async () => {
+    const input = await fixture();
+    const original = input.downloader.resolveYouTube;
+    vi.spyOn(input.downloader, 'resolveYouTube').mockImplementation(async (url) => {
+      const video = await original(url);
+      return { ...video, download: async (limit) => ({ ...await video.download(limit), deliveryMode: 'document' }) };
+    });
+    input.whatsapp.sendVideoOnce.mockRejectedValue(new Error('Unknown outcome'));
+    await handleIncomingMessage(input);
+    expect(input.whatsapp.sendVideoOnce).toHaveBeenCalledWith(baseMessage.groupId, input.artifacts[0], expect.stringContaining('Sent by Mom'), 'document');
+    await handleIncomingMessage(input);
+    expect(input.whatsapp.sendVideoOnce).toHaveBeenCalledOnce();
+    expect(input.whatsapp.sendVideo).not.toHaveBeenCalled();
+    expect(input.store.countReposts()).toBe(0);
+    expect(input.whatsapp.deleteMessage).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the current group budget before reserving a send and cleans the rejected media', async () => {
+    const input = await fixture();
+    const getSettings = input.store.getGroupSettings;
+    vi.spyOn(input.store, 'getGroupSettings').mockImplementation((groupId) => ({ ...getSettings(groupId), maxFileSizeMb: 128 }));
+    const resolveVideo = input.downloader.resolveYouTube;
+    vi.spyOn(input.downloader, 'resolveYouTube').mockImplementation(async (url) => {
+      const video = await resolveVideo(url);
+      return { ...video, download: async (limit) => {
+        const download = await video.download(limit);
+        writeFileSync(download.filePath, Buffer.alloc(1024 * 1024 + 1));
+        return download;
+      } };
+    });
+    await handleIncomingMessage({ ...input, maxMediaSizeMb: 1 });
+    expect(input.whatsapp.sendVideoOnce).not.toHaveBeenCalled();
+    expect(input.store.getMediaDisposition({ groupId: baseMessage.groupId, messageId: baseMessage.id, identity: { platform: 'youtube', videoId: 'AbCdEf123_-' } }, input.nowMs, 24)).toBe('ready');
+    expect(existsSync(input.artifacts[0])).toBe(false);
+    expect(input.store.getGroupSettings(baseMessage.groupId).maxFileSizeMb).toBe(128);
   });
 
   it.each(['non-group', 'from-me', 'unsupported', 'disabled'] as const)('ignores %s source messages', async (mode) => {
