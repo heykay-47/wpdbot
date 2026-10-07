@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
 import { mediaIdentityKey, type MediaIdentity } from './mediaIdentity.js';
+import { validateRelaySource, type RelaySource } from './relayState.js';
 
 export type GroupSettings = {
   groupId: string;
@@ -20,10 +21,12 @@ export type RepostRecord = {
 
 export type InstagramItemKey = { groupId: string; messageId: string; postId: string; itemId: string };
 export type RepostConfirmation = { messageId: string; ack: number };
+export type RepostEvidence = { messageId: string; ack: number | null };
 export type InstagramItemProgress = { status: 'sending' | 'confirmed'; sentMessageId: string | null; ack: number | null };
 
 export type MediaRepostKey = { groupId: string; messageId: string; identity: MediaIdentity };
 export type MediaDisposition = 'ready' | 'completed' | 'duplicate' | 'held';
+export type MediaAttempt = { status: 'sending' | 'confirmed'; sentMessageId: string | null; ack: number | null; sourceUrl: string };
 
 export type StoreDefaults = {
   maxFileSizeMb?: number;
@@ -37,6 +40,10 @@ export type GroupMetadata = {
 };
 
 export type Store = {
+  acceptRelaySource(source: RelaySource): void;
+  getRelaySource(groupId: string, messageId: string): RelaySource | null;
+  saveRelaySource(source: RelaySource): void;
+  listRelaySources(): RelaySource[];
   getGroupSettings(groupId: string): GroupSettings;
   setGroupEnabled(groupId: string, enabled: boolean): void;
   recordDuplicate(groupId: string, urlHash: string, createdAtMs: number): void;
@@ -53,6 +60,8 @@ export type Store = {
   getMediaDisposition(key: MediaRepostKey, nowMs: number, windowHours: number): MediaDisposition;
   beginMediaRepost(key: MediaRepostKey, record: RepostRecord, windowHours: number): 'started' | Exclude<MediaDisposition, 'ready'>;
   confirmMediaRepost(key: MediaRepostKey, confirmation: RepostConfirmation, record: RepostRecord): void;
+  getMediaAttempt(key: MediaRepostKey): MediaAttempt | null;
+  recordMediaEvidence(key: MediaRepostKey, evidence: RepostEvidence): void;
   countReposts(): number;
   close(): void;
 };
@@ -156,7 +165,19 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS media_relay_pending
       ON media_relay_attempts (group_id, media_key) WHERE status = 'sending';
+
+    CREATE TABLE IF NOT EXISTS relay_sources (
+      group_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      state_json TEXT NOT NULL,
+      PRIMARY KEY (group_id, message_id)
+    );
   `);
+
+  const insertRelaySource = db.prepare('INSERT OR IGNORE INTO relay_sources (group_id, message_id, state_json) VALUES (?, ?, ?)');
+  const selectRelaySource = db.prepare<[string, string], { state: string }>('SELECT state_json AS state FROM relay_sources WHERE group_id = ? AND message_id = ?');
+  const updateRelaySource = db.prepare('UPDATE relay_sources SET state_json = ? WHERE group_id = ? AND message_id = ?');
+  const selectRelaySources = db.prepare<[], { state: string }>('SELECT state_json AS state FROM relay_sources ORDER BY rowid');
 
   const insertDefaultSettings = db.prepare(`
     INSERT OR IGNORE INTO group_settings (group_id, enabled, max_file_size_mb, duplicate_window_hours)
@@ -245,6 +266,15 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
   const selectSourceMedia = db.prepare<[string, string, string], { status: 'sending' | 'confirmed' }>(`
     SELECT status FROM media_relay_attempts WHERE group_id = ? AND message_id = ? AND media_key = ?
   `);
+  const selectMediaAttempt = db.prepare<[string, string, string], MediaAttempt>(`
+    SELECT status, sent_message_id AS sentMessageId, ack, source_url AS sourceUrl FROM media_relay_attempts
+    WHERE group_id = ? AND message_id = ? AND media_key = ?
+  `);
+  const updateMediaEvidence = db.prepare(`
+    UPDATE media_relay_attempts SET sent_message_id = ?, ack = ?
+    WHERE group_id = ? AND message_id = ? AND media_key = ? AND status = 'sending'
+      AND (sent_message_id IS NULL OR sent_message_id = ?)
+  `);
   const selectMediaConfirmation = db.prepare<[string, string], { confirmedAtMs: number | null }>(`
     SELECT max(confirmed_at_ms) AS confirmedAtMs FROM media_relay_attempts
     WHERE group_id = ? AND media_key = ? AND status = 'confirmed'
@@ -252,6 +282,7 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
   const updateMediaConfirmation = db.prepare(`
     UPDATE media_relay_attempts SET status = 'confirmed', confirmed_at_ms = ?, sent_message_id = ?, ack = ?
     WHERE group_id = ? AND message_id = ? AND media_key = ? AND source_url = ? AND status = 'sending'
+      AND (sent_message_id IS NULL OR sent_message_id = ?)
   `);
   const selectLegacyPendingItem = db.prepare<[string, string, string], { message_id: string }>(`
     SELECT message_id FROM instagram_relay_items
@@ -284,12 +315,41 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
     }
     if (!Number.isSafeInteger(record.createdAtMs)) throw new Error('Media confirmation timestamp is invalid');
     const changed = updateMediaConfirmation.run(record.createdAtMs, confirmation.messageId, confirmation.ack,
-      key.groupId, key.messageId, mediaIdentityKey(key.identity), record.url);
+      key.groupId, key.messageId, mediaIdentityKey(key.identity), record.url, confirmation.messageId);
     if (!changed.changes) throw new Error('Media send reservation is missing or already confirmed');
     insertRepost.run(record.groupId, record.senderId, record.url, record.urlHash, record.createdAtMs);
   });
 
   return {
+    acceptRelaySource(source) {
+      validateRelaySource(source);
+      insertRelaySource.run(source.groupId, source.messageId, JSON.stringify(source));
+    },
+
+    getRelaySource(groupId, messageId) {
+      const row = selectRelaySource.get(groupId, messageId);
+      if (!row) return null;
+      const source = JSON.parse(row.state) as RelaySource;
+      validateRelaySource(source);
+      if (source.groupId !== groupId || source.messageId !== messageId) throw new Error('Durable source identity does not match its record');
+      return source;
+    },
+
+    saveRelaySource(source) {
+      validateRelaySource(source);
+      if (!updateRelaySource.run(JSON.stringify(source), source.groupId, source.messageId).changes) {
+        throw new Error('Durable source is missing');
+      }
+    },
+
+    listRelaySources() {
+      return selectRelaySources.all().map((row) => {
+        const source = JSON.parse(row.state) as RelaySource;
+        validateRelaySource(source);
+        return source;
+      });
+    },
+
     getGroupSettings(groupId) {
       insertDefaultSettings.run(groupId, maxFileSizeMb, duplicateWindowHours);
       const row = selectSettings.get(groupId);
@@ -373,6 +433,18 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
     beginMediaRepost: beginMediaRepost.immediate,
 
     confirmMediaRepost,
+
+    getMediaAttempt(key) {
+      return selectMediaAttempt.get(key.groupId, key.messageId, mediaIdentityKey(key.identity)) ?? null;
+    },
+
+    recordMediaEvidence(key, evidence) {
+      if (!evidence.messageId.trim() || (evidence.ack !== null && (!Number.isInteger(evidence.ack) || evidence.ack < -1 || evidence.ack > 4))) {
+        throw new Error('Repost evidence is invalid');
+      }
+      if (!updateMediaEvidence.run(evidence.messageId, evidence.ack, key.groupId, key.messageId,
+        mediaIdentityKey(key.identity), evidence.messageId).changes) throw new Error('Repost evidence has no matching pending attempt');
+    },
 
     countReposts() {
       return selectRepostCount.get()?.count ?? 0;

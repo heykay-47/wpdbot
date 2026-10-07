@@ -13,6 +13,7 @@ services:
       WHATSAPP_AUTH_DIR: /app/.wwebjs_auth
       WHATSAPP_CACHE_DIR: /app/.wwebjs_cache
     restart: unless-stopped
+    stop_grace_period: 35s
     depends_on:
       - bgutil-provider
     volumes:

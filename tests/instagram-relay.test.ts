@@ -113,7 +113,7 @@ describe('Instagram collection relaying', () => {
     expect(input.whatsapp.deleteMessage).not.toHaveBeenCalled();
   });
 
-  it('continues after a definite download failure and resumes only unsent items on a later source event', async () => {
+  it('continues after a definite download failure without automatically retrying recorded failures on later source events', async () => {
     const failDownloads = new Set(['video-2']);
     const input = await fixture({ ...metadata, entries: [metadata.entries[0],
       { id: 'video-2', formats: [{ url: 'https://media.example/two.mp4', ext: 'mp4' }] }, metadata.entries[2],
@@ -126,8 +126,8 @@ describe('Instagram collection relaying', () => {
 
     await handleIncomingMessage(input);
 
-    expect(input.whatsapp.sendVideoOnce.mock.calls.map((call) => basename(call[1]))).toEqual(['video-1.mp4', 'video-3.mp4', 'video-2.mp4']);
-    expect(input.store.countReposts()).toBe(3);
+    expect(input.whatsapp.sendVideoOnce.mock.calls.map((call) => basename(call[1]))).toEqual(['video-1.mp4', 'video-3.mp4']);
+    expect(input.store.countReposts()).toBe(2);
     expect(input.downloads.every((path) => !existsSync(dirname(path)))).toBe(true);
   });
 

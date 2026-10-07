@@ -1,6 +1,9 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
+import { createStore, type Store } from '../src/store';
+import { handleIncomingMessage } from '../src/relay';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 const execaMock = vi.hoisted(() => vi.fn(async () => ({ stdout: '' })));
@@ -9,6 +12,7 @@ const clients: MockClient[] = [];
 const mediaPaths: string[] = [];
 const deletedMessages: Array<{ delete: ReturnType<typeof vi.fn> }> = [];
 const tempDirs: string[] = [];
+const stores: Store[] = [];
 
 function runtimePaths() {
   const root = mkdtempSync(join(tmpdir(), 'wpdbot-whatsapp-test-'));
@@ -21,6 +25,9 @@ function runtimePaths() {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
+  for (const store of stores) store.close();
+  stores.length = 0;
   for (const dir of tempDirs) rmSync(dir, { force: true, recursive: true });
   tempDirs.length = 0;
 });
@@ -48,26 +55,28 @@ class MockMessageMedia {
   }
 }
 
-class MockClient {
+class MockClient extends EventEmitter {
   options: unknown;
   info = { wid: { _serialized: 'bot@c.us' } };
   handlers = new Map<string, (value?: unknown) => unknown>();
   initialize = vi.fn();
   sendMessage = vi.fn(async (_to: string, _content: unknown, _options?: unknown): Promise<{ id?: { _serialized: string }; ack?: number; fromMe?: boolean; to?: string }> => ({ id: { _serialized: 'sent-message-id' } }));
-  getMessageById = vi.fn(async () => {
+  destroy = vi.fn(async () => undefined);
+  getMessageById = vi.fn(async (): Promise<any> => {
     const message = { delete: vi.fn() };
     deletedMessages.push(message);
     return message;
   });
 
   constructor(options: unknown) {
+    super();
     this.options = options;
     clients.push(this);
   }
 
-  on(event: string, handler: (value?: unknown) => unknown) {
+  on(event: string, handler: (...values: any[]) => unknown) {
     this.handlers.set(event, handler);
-    return this;
+    return super.on(event, handler);
   }
 }
 
@@ -142,13 +151,32 @@ describe('createWhatsappBot', () => {
     await vi.waitFor(() => expect(clients[0].initialize).toHaveBeenCalledOnce());
   });
 
+  test('recovers accepted work only after the client is ready, using exact source lookup', async () => {
+    const store = fakeStore();
+    store.getGroupSettings.mockReturnValue({ groupId: 'group-1@g.us', enabled: true, maxFileSizeMb: 64, duplicateWindowHours: 24 });
+    const downloader = fakeDownloader();
+    const body = 'https://youtube.com/shorts/AbCdEf123_-';
+    await handleIncomingMessage({ message: { id: 'message-1', groupId: 'group-1@g.us', senderId: 'admin@c.us', senderName: 'Admin',
+      body, timestampMs: 1_000, isGroup: true, fromMe: false }, store, downloader,
+      whatsapp: { sendVideo: vi.fn(), sendVideoOnce: vi.fn(), sendText: vi.fn(), deleteMessage: vi.fn() },
+      timezone: 'UTC', queue: { run: async () => undefined } });
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: baseConfig(), store, downloader });
+    clients[0].getMessageById.mockResolvedValueOnce(fakeMessage(body));
+    clients[0].sendMessage.mockResolvedValueOnce({ id: { _serialized: 'recovered-1' }, ack: 1, fromMe: true, to: 'group-1@g.us' });
+    expect(downloader.download).not.toHaveBeenCalled();
+    await clients[0].handlers.get('ready')?.();
+    await vi.waitFor(() => expect(store.confirmMediaRepost).toHaveBeenCalledOnce());
+    expect(clients[0].getMessageById).toHaveBeenCalledWith('message-1');
+  });
+
   test('enables group only when requester and bot are admins', async () => {
     const store = fakeStore();
     const { createWhatsappBot } = await import('../src/whatsapp');
     createWhatsappBot({ config: baseConfig(), store, downloader: fakeDownloader() });
     const message = fakeMessage('!bot enable');
 
-    await clients[0].handlers.get('message')?.(message);
+    await deliver(message);
 
     expect(store.setGroupEnabled).toHaveBeenCalledWith('group-1@g.us', true);
     expect(message.reply).toHaveBeenCalledWith('Bot enabled.');
@@ -160,7 +188,7 @@ describe('createWhatsappBot', () => {
     createWhatsappBot({ config: baseConfig(), store, downloader: fakeDownloader() });
     const message = fakeMessage('!bot enable', { botIsAdmin: false });
 
-    await clients[0].handlers.get('message')?.(message);
+    await deliver(message);
 
     expect(store.setGroupEnabled).not.toHaveBeenCalled();
     expect(message.reply).toHaveBeenCalledWith('Make bot a group admin before enabling.');
@@ -171,7 +199,7 @@ describe('createWhatsappBot', () => {
     createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
     const message = fakeMessage('!bot status');
 
-    await clients[0].handlers.get('message')?.(message);
+    await deliver(message);
 
     expect(message.reply).toHaveBeenCalledWith(
       'Bot status: disabled\nMax size: 64 MB\nDuplicate window: 24 hours\nSupported: Instagram reels/posts, YouTube Shorts\nBot admin: yes',
@@ -190,7 +218,7 @@ describe('createWhatsappBot', () => {
       ],
     });
 
-    await clients[0].handlers.get('message')?.(message);
+    await deliver(message);
 
     expect(message.reply).toHaveBeenCalledWith(
       'Bot status: disabled\nMax size: 64 MB\nDuplicate window: 24 hours\nSupported: Instagram reels/posts, YouTube Shorts\nBot admin: yes',
@@ -211,7 +239,7 @@ describe('createWhatsappBot', () => {
       ],
     });
 
-    await clients[0].handlers.get('message')?.(message);
+    await deliver(message);
 
     expect(message.reply).toHaveBeenCalledWith(
       'Bot status: disabled\nMax size: 64 MB\nDuplicate window: 24 hours\nSupported: Instagram reels/posts, YouTube Shorts\nBot admin: yes',
@@ -232,7 +260,7 @@ describe('createWhatsappBot', () => {
       ],
     });
 
-    await clients[0].handlers.get('message')?.(message);
+    await deliver(message);
 
     expect(store.setGroupEnabled).toHaveBeenCalledWith('group-1@g.us', true);
     expect(message.reply).toHaveBeenCalledWith('Bot enabled.');
@@ -244,7 +272,7 @@ describe('createWhatsappBot', () => {
     createWhatsappBot({ config: baseConfig(), store, downloader: fakeDownloader() });
     const message = fakeMessage('!bot status', { fromMe: true });
 
-    await clients[0].handlers.get('message')?.(message);
+    await deliver(message);
 
     expect(message.reply).not.toHaveBeenCalled();
     expect(store.getGroupSettings).not.toHaveBeenCalled();
@@ -262,7 +290,7 @@ describe('createWhatsappBot', () => {
       links: [{ link: 'https://www.instagram.com/reel/DWJbfWGDBQg/', isSuspicious: false }],
     });
 
-    await clients[0].handlers.get('message')?.(message);
+    await deliver(message);
 
     expect(downloader.download).toHaveBeenCalledWith('https://www.instagram.com/reel/DWJbfWGDBQg/', 64);
     expect(store.confirmMediaRepost).toHaveBeenCalledWith(
@@ -293,7 +321,7 @@ describe('createWhatsappBot', () => {
     clients[0].sendMessage.mockResolvedValueOnce({ id: { _serialized: 'instagram-1' }, ack: 1, fromMe: true, to: 'group-1@g.us' });
 
     await expect(bot.relayWhatsapp.sendVideoOnce('group-1@g.us', '/tmp/video.mp4', 'caption')).resolves.toEqual({ messageId: 'instagram-1', ack: 1 });
-    expect(clients[0].sendMessage).toHaveBeenCalledWith('group-1@g.us', expect.any(MockMessageMedia), { caption: 'caption', waitUntilMsgSent: true });
+    expect(clients[0].sendMessage).toHaveBeenCalledWith('group-1@g.us', expect.any(MockMessageMedia), { caption: 'caption', waitUntilMsgSent: false });
     clients[0].sendMessage.mockClear().mockRejectedValueOnce(new Error('connection lost after submission'));
 
     await expect(bot.relayWhatsapp.sendVideoOnce('group-1@g.us', '/tmp/video.mp4', 'caption')).rejects.toThrow('connection lost');
@@ -307,11 +335,14 @@ describe('createWhatsappBot', () => {
     { id: { _serialized: 'wrong-group' }, ack: 1, fromMe: true, to: 'other-group@g.us' },
     { id: { _serialized: 'wrong-sender' }, ack: 1, fromMe: false, to: 'group-1@g.us' },
   ])('does not claim Instagram confirmation without suitable ID, ACK, and group evidence: %j', async (result) => {
+    vi.useFakeTimers();
     const { createWhatsappBot } = await import('../src/whatsapp');
     const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
     clients[0].sendMessage.mockResolvedValueOnce(result);
 
-    await expect(bot.relayWhatsapp.sendVideoOnce('group-1@g.us', '/tmp/video.mp4', 'caption')).rejects.toThrow('acceptance is unknown');
+    const rejected = expect(bot.relayWhatsapp.sendVideoOnce('group-1@g.us', '/tmp/video.mp4', 'caption')).rejects.toThrow('acceptance is unknown');
+    await vi.advanceTimersByTimeAsync(30_000);
+    await rejected;
 
     expect(clients[0].sendMessage).toHaveBeenCalledOnce();
     expect(execaMock).not.toHaveBeenCalled();
@@ -331,9 +362,126 @@ describe('createWhatsappBot', () => {
     const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
     clients[0].sendMessage.mockResolvedValueOnce({ id: { _serialized: 'document-1' }, ack: 1, fromMe: true, to: 'group-1@g.us' });
     await expect(bot.relayWhatsapp.sendVideoOnce('group-1@g.us', '/tmp/video.mp4', 'caption', 'document')).resolves.toEqual({ messageId: 'document-1', ack: 1 });
-    expect(clients[0].sendMessage).toHaveBeenCalledWith('group-1@g.us', expect.any(MockMessageMedia), { caption: 'caption', waitUntilMsgSent: true, sendMediaAsDocument: true });
+    expect(clients[0].sendMessage).toHaveBeenCalledWith('group-1@g.us', expect.any(MockMessageMedia), { caption: 'caption', waitUntilMsgSent: false, sendMediaAsDocument: true });
     clients[0].sendMessage.mockClear().mockRejectedValueOnce(new Error('Unknown document outcome'));
     await expect(bot.relayWhatsapp.sendVideoOnce('group-1@g.us', '/tmp/video.mp4', 'caption', 'document')).rejects.toThrow('Unknown document outcome');
+    expect(clients[0].sendMessage).toHaveBeenCalledOnce();
+  });
+
+  test('records a pending ID immediately, then confirms a matching acknowledgement without submitting again', async () => {
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
+    const sent = { id: { _serialized: 'pending-1' }, ack: 0, fromMe: true, to: 'group-1@g.us' };
+    clients[0].sendMessage.mockResolvedValueOnce(sent);
+    const observe = vi.fn();
+    const submission = bot.relayWhatsapp.sendVideoOnce('group-1@g.us', '/tmp/video.mp4', 'caption', undefined, observe);
+    await vi.waitFor(() => expect(observe).toHaveBeenCalledWith({ messageId: 'pending-1', ack: 0 }));
+    clients[0].emit('message_ack', sent, 1);
+    await expect(submission).resolves.toEqual({ messageId: 'pending-1', ack: 1 });
+    expect(clients[0].sendMessage).toHaveBeenCalledOnce();
+  });
+
+  test('retains a trustworthy returned ID even when the returned acknowledgement is unavailable', async () => {
+    vi.useFakeTimers();
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
+    clients[0].sendMessage.mockResolvedValueOnce({ id: { _serialized: 'unknown-ack' }, fromMe: true, to: 'group-1@g.us' });
+    const observe = vi.fn();
+    const rejected = expect(bot.relayWhatsapp.sendVideoOnce('group-1@g.us', '/tmp/video.mp4', 'caption', undefined, observe)).rejects.toThrow('acceptance is unknown');
+    await vi.advanceTimersByTimeAsync(30_000);
+    await rejected;
+    expect(observe).toHaveBeenCalledWith({ messageId: 'unknown-ack', ack: null });
+    expect(clients[0].sendMessage).toHaveBeenCalledOnce();
+  });
+
+  test('bounds an unresolved submission while still reporting positive evidence when its promise finishes late', async () => {
+    vi.useFakeTimers();
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
+    let finish!: (value: any) => void;
+    clients[0].sendMessage.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const observe = vi.fn();
+    const rejected = expect(bot.relayWhatsapp.sendVideoOnce('group-1@g.us', '/tmp/video.mp4', 'caption', undefined, observe)).rejects.toThrow('acceptance is unknown');
+    await vi.advanceTimersByTimeAsync(30_000);
+    await rejected;
+    finish({ id: { _serialized: 'late-1' }, ack: 1, fromMe: true, to: 'group-1@g.us' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(observe).toHaveBeenCalledWith({ messageId: 'late-1', ack: 1 });
+    expect(clients[0].sendMessage).toHaveBeenCalledOnce();
+  });
+
+  test('correlates an ACK observed after timeout but before the send promise returns its ID', async () => {
+    vi.useFakeTimers();
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
+    let finish!: (value: any) => void;
+    clients[0].sendMessage.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const observe = vi.fn();
+    const rejected = expect(bot.relayWhatsapp.sendVideoOnce('group-1@g.us', '/tmp/video.mp4', 'caption', undefined, observe)).rejects.toThrow('acceptance is unknown');
+    await vi.advanceTimersByTimeAsync(30_000);
+    await rejected;
+    await vi.advanceTimersByTimeAsync(1_000);
+    clients[0].emit('message_ack', { id: { _serialized: 'unrelated-repost' }, fromMe: true, to: 'group-1@g.us' }, 4);
+    clients[0].emit('message_ack', { id: { _serialized: 'late-1' }, fromMe: true, to: 'group-1@g.us' }, 1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    finish({ id: { _serialized: 'late-1' }, ack: 0, fromMe: true, to: 'group-1@g.us' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(observe).toHaveBeenCalledWith({ messageId: 'late-1', ack: 1 });
+    expect(clients[0].sendMessage).toHaveBeenCalledOnce();
+    expect(clients[0].listenerCount('message_ack')).toBe(1);
+  });
+
+  test.each(['cached', 'returned'] as const)('keeps positive %s ACK evidence when another observation is stale', async (mode) => {
+    vi.useFakeTimers();
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
+    let finish!: (value: any) => void;
+    clients[0].sendMessage.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const confirmed = bot.relayWhatsapp.sendVideoOnce('group-1@g.us', '/tmp/video.mp4', 'caption').catch((error: unknown) => error);
+    const sent = { id: { _serialized: 'repost-1' }, fromMe: true, to: 'group-1@g.us' };
+    if (mode === 'cached') clients[0].emit('message_ack', sent, 1);
+    clients[0].emit('message_ack', sent, 0);
+    finish({ ...sent, ack: mode === 'returned' ? 1 : 0 });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(await confirmed).toEqual({ messageId: 'repost-1', ack: 1 });
+  });
+
+  test('shutdown removes unresolved-ID ACK correlations and ignores callbacks arriving after close', async () => {
+    vi.useFakeTimers();
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
+    let finish!: (value: any) => void;
+    clients[0].sendMessage.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const observe = vi.fn();
+    const rejected = expect(bot.relayWhatsapp.sendVideoOnce('group-1@g.us', '/tmp/video.mp4', 'caption', undefined, observe)).rejects.toThrow('acceptance is unknown');
+    await vi.advanceTimersByTimeAsync(30_000);
+    await rejected;
+    await bot.stop();
+    expect(clients[0].listenerCount('message_ack')).toBe(1);
+    clients[0].emit('message_ack', { id: { _serialized: 'after-close' }, fromMe: true, to: 'group-1@g.us' }, 1);
+    finish({ id: { _serialized: 'after-close' }, ack: 1, fromMe: true, to: 'group-1@g.us' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(observe).not.toHaveBeenCalled();
+  });
+
+  test('shutdown drains active submissions before destroying the client, without logging out or starting queued work', async () => {
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const store = fakeStore();
+    store.getGroupSettings.mockReturnValue({ groupId: 'group-1@g.us', enabled: true, maxFileSizeMb: 64, duplicateWindowHours: 24 });
+    const bot = createWhatsappBot({ config: baseConfig(), store, downloader: fakeDownloader() });
+    await clients[0].handlers.get('ready')?.();
+    let finish!: (value: any) => void;
+    clients[0].sendMessage.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const relaying = clients[0].handlers.get('message')?.(fakeMessage('https://youtube.com/shorts/AbCdEf123_-'));
+    await vi.waitFor(() => expect(clients[0].sendMessage).toHaveBeenCalledOnce());
+    const stopping = bot.stop();
+    await clients[0].handlers.get('message')?.(fakeMessage('https://instagram.com/p/other/'));
+    expect(clients[0].destroy).not.toHaveBeenCalled();
+    finish({ id: { _serialized: 'shutdown-1' }, ack: 1, fromMe: true, to: 'group-1@g.us' });
+    await stopping;
+    await relaying;
+    expect(store.confirmMediaRepost).toHaveBeenCalledOnce();
+    expect(clients[0].destroy).toHaveBeenCalledOnce();
     expect(clients[0].sendMessage).toHaveBeenCalledOnce();
   });
 });
@@ -350,8 +498,16 @@ function baseConfig() {
   };
 }
 
+async function deliver(message: ReturnType<typeof fakeMessage>) {
+  await clients[0].handlers.get('ready')?.();
+  return clients[0].handlers.get('message')?.(message);
+}
+
 function fakeStore() {
+  const store = createStore(':memory:');
+  stores.push(store);
   return {
+    ...store,
     getGroupSettings: vi.fn(() => ({ groupId: 'group-1@g.us', enabled: false, maxFileSizeMb: 64, duplicateWindowHours: 24 })),
     setGroupEnabled: vi.fn(),
     recordDuplicate: vi.fn(),
@@ -366,8 +522,8 @@ function fakeStore() {
     beginInstagramItem: vi.fn(() => true),
     confirmInstagramItem: vi.fn(),
     getMediaDisposition: vi.fn(() => 'ready' as const),
-    beginMediaRepost: vi.fn(() => 'started' as const),
-    confirmMediaRepost: vi.fn(),
+    beginMediaRepost: vi.fn(store.beginMediaRepost),
+    confirmMediaRepost: vi.fn(store.confirmMediaRepost),
     countReposts: vi.fn(() => 0),
     close: vi.fn(),
   };

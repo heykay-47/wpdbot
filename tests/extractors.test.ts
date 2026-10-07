@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { extractFirstSupportedUrl, normalizeUrlForDuplicate, supportedExtractors } from '../src/extractors';
+import { extractFirstSupportedUrl, extractSupportedUrls, normalizeUrlForDuplicate, supportedExtractors } from '../src/extractors';
 
 describe('extractor registry', () => {
+  it('collects supported links in appearance order, collapsing only exact repetitions', () => {
+    expect(extractSupportedUrls('https://example.com https://instagram.com/p/C123/ https://youtube.com/shorts/abc123 https://instagram.com/p/C123/ http://m.youtube.com/shorts/abc123'))
+      .toEqual([
+        { extractorId: 'instagram', platform: 'instagram', url: 'https://instagram.com/p/C123/' },
+        { extractorId: 'youtube', platform: 'youtube', url: 'https://youtube.com/shorts/abc123' },
+        { extractorId: 'youtube', platform: 'youtube', url: 'http://m.youtube.com/shorts/abc123' },
+      ]);
+  });
   it('exposes stable extractor ids for current platforms only', () => {
     expect(supportedExtractors.map((extractor) => extractor.id)).toEqual(['youtube', 'instagram']);
   });

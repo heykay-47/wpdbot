@@ -3,11 +3,13 @@ import { rm, stat } from 'node:fs/promises';
 import { basename, dirname, relative, resolve } from 'node:path';
 import { formatCaption } from './caption.js';
 import type { Downloader } from './downloader.js';
-import { messageForError, userError, type ErrorReportContext } from './errorReporter.js';
+import { messageForError, userError, UserFacingError, type ErrorReportContext } from './errorReporter.js';
 import type { KeyedTaskQueue } from './keyedTaskQueue.js';
-import { extractFirstSupportedUrl, normalizeUrlForDuplicate } from './extractors.js';
-import { candidateMediaIdentity, sourceRequestKey, type MediaIdentity } from './mediaIdentity.js';
-import type { MediaRepostKey, RepostConfirmation, Store } from './store.js';
+import { extractSupportedUrls, normalizeUrlForDuplicate } from './extractors.js';
+import { candidateMediaIdentity, type MediaIdentity } from './mediaIdentity.js';
+import type { MediaRepostKey, RepostConfirmation, RepostEvidence, Store } from './store.js';
+import type { RelayItem, RelayLink, RelayPlan, RelaySource } from './relayState.js';
+import type { RelayLifecycle } from './relayLifecycle.js';
 
 export type IncomingMessage = {
   id: string;
@@ -21,10 +23,10 @@ export type IncomingMessage = {
 };
 
 export type RelayWhatsapp = {
-  sendVideo(groupId: string, filePath: string, caption: string): Promise<void>;
-  sendVideoOnce(groupId: string, filePath: string, caption: string, deliveryMode?: 'document'): Promise<RepostConfirmation>;
+  sendVideo(groupId: string, filePath: string, caption: string): Promise<unknown>;
+  sendVideoOnce(groupId: string, filePath: string, caption: string, deliveryMode?: 'document', observe?: (evidence: RepostEvidence) => void): Promise<RepostConfirmation>;
   sendText(groupId: string, text: string): Promise<void>;
-  deleteMessage(messageId: string): Promise<void>;
+  deleteMessage(groupId: string, messageId: string): Promise<void>;
 };
 
 export type RelayDownloader = {
@@ -35,7 +37,8 @@ export type RelayDownloader = {
 
 export type HandleIncomingMessageInput = {
   message: IncomingMessage;
-  store: Pick<Store, 'getGroupSettings' | 'wasRecentlyPosted' | 'getMediaDisposition' | 'beginMediaRepost' | 'confirmMediaRepost'>;
+  store: Pick<Store, 'getGroupSettings' | 'wasRecentlyPosted' | 'getMediaDisposition' | 'beginMediaRepost' | 'confirmMediaRepost'
+    | 'acceptRelaySource' | 'getRelaySource' | 'saveRelaySource' | 'listRelaySources' | 'getMediaAttempt' | 'recordMediaEvidence'>;
   whatsapp: RelayWhatsapp;
   downloader: RelayDownloader;
   timezone: string;
@@ -46,6 +49,15 @@ export type HandleIncomingMessageInput = {
   cleanupPath?: (filePath: string) => Promise<void>;
   queue?: Pick<KeyedTaskQueue, 'run'>;
   logger?: (entry: Record<string, unknown>) => void;
+  control?: RelayLifecycle;
+};
+
+type ActiveInput = HandleIncomingMessageInput & { source: RelaySource; link: RelayLink };
+export type RecoveryInput = Omit<HandleIncomingMessageInput, 'message'> & {
+  whatsapp: RelayWhatsapp & {
+    getSourceMessage(groupId: string, messageId: string): Promise<IncomingMessage | null>;
+    lookupRepost(groupId: string, messageId: string): Promise<RepostConfirmation | null>;
+  };
 };
 
 function hashUrl(value: string): string {
@@ -74,6 +86,7 @@ function safeDownloadMessage(error: unknown): string {
 }
 
 export async function handleIncomingMessage(input: HandleIncomingMessageInput): Promise<void> {
+  if (input.control && !input.control.canSubmit()) return;
   const errorContext: ErrorReportContext = {
     step: 'relay',
     groupId: input.message.groupId,
@@ -84,10 +97,9 @@ export async function handleIncomingMessage(input: HandleIncomingMessageInput): 
   try {
     await handleIncomingMessageCore(input, errorContext);
   } catch (error) {
-    const text = messageForError(error, errorContext);
-    await input.whatsapp.sendText(input.message.groupId, text).catch((reportError: unknown) => {
-      messageForError(reportError, errorContext);
-    });
+    if (!(error instanceof UserFacingError)) input.control?.failStorage();
+    if (input.control && !input.control.canPersist()) return;
+    await reportError(input, error, errorContext);
   }
 }
 
@@ -95,95 +107,230 @@ async function handleIncomingMessageCore(input: HandleIncomingMessageInput, erro
   const { message, store, queue } = input;
   if (!message.isGroup || message.fromMe) return;
 
-  const supportedUrl = extractFirstSupportedUrl(message.body);
-  if (!supportedUrl) return;
-  errorContext.extractorId = supportedUrl.extractorId;
+  const links = extractSupportedUrls(message.body);
+  if (!links.length) return;
+  errorContext.extractorId = links[0].extractorId;
 
   errorContext.step = 'settings';
   const settings = store.getGroupSettings(message.groupId);
   if (!settings.enabled) return;
 
-  const normalizedUrl = normalizeUrlForDuplicate(supportedUrl.url);
-  const urlHash = hashUrl(normalizedUrl);
-  errorContext.urlHash = urlHash;
-
-  errorContext.step = 'duplicate-check';
-  if (settings.duplicateWindowHours > 0 && store.wasRecentlyPosted(message.groupId, urlHash, processingNow(input), settings.duplicateWindowHours)) return;
+  if (!message.id.trim()) throw userError(`${links[0].platform === 'youtube' ? 'YouTube' : 'Instagram'} relay needs a source message ID. Original message kept.`);
+  errorContext.step = 'record';
+  store.acceptRelaySource({
+    version: 1, groupId: message.groupId, messageId: message.id, senderId: message.senderId,
+    senderName: message.senderName, timestampMs: message.timestampMs, acceptedAtMs: processingNow(input),
+    contentHash: hashUrl(message.body), status: 'ready', cleanup: 'retained',
+    links: links.map((link) => ({ url: link.url, platform: link.platform, urlHash: hashUrl(normalizeUrlForDuplicate(link.url)), status: 'ready', plan: null })),
+  });
 
   const runRelay = async () => {
-    const currentSettings = store.getGroupSettings(message.groupId);
-    if (!currentSettings.enabled) return;
-    errorContext.step = 'duplicate-check';
-    if (currentSettings.duplicateWindowHours > 0 && store.wasRecentlyPosted(message.groupId, urlHash, processingNow(input), currentSettings.duplicateWindowHours)) return;
-    if (supportedUrl.extractorId === 'instagram') {
-      await relayInstagram(input, supportedUrl.url, urlHash, errorContext);
+    if (input.control && !input.control.canPersist()) return;
+    const source = store.getRelaySource(message.groupId, message.id)!;
+    if (source.status === 'settled' || source.status === 'held') return;
+    if (source.contentHash !== hashUrl(message.body) || source.senderId !== message.senderId) {
+      source.status = 'held';
+      source.holdReason = 'source-changed';
+      store.saveRelaySource(source);
       return;
     }
-    await relayYouTube(input, supportedUrl.url, urlHash, errorContext);
+    if (!checkpoint(input, source)) return;
+    source.status = 'ready';
+    for (const link of source.links) {
+      if (link.status !== 'ready') continue;
+      errorContext.extractorId = link.platform;
+      errorContext.urlHash = link.urlHash;
+      const active = { ...input, source, link };
+      if (!checkpoint(input, source)) return;
+      const currentSettings = store.getGroupSettings(message.groupId);
+      if (!currentSettings.enabled) { source.status = 'paused'; break; }
+      if (!link.plan && currentSettings.duplicateWindowHours > 0
+        && store.wasRecentlyPosted(message.groupId, link.urlHash, processingNow(input), currentSettings.duplicateWindowHours)) {
+        link.status = 'skipped';
+        store.saveRelaySource(source);
+        continue;
+      }
+      try {
+        if (link.platform === 'instagram') await relayInstagram(active, link.url, link.urlHash, errorContext);
+        else await relayYouTube(active, link.url, link.urlHash, errorContext);
+      } catch (error) {
+        if (!(error instanceof UserFacingError)) throw error;
+        await reportError(input, error, errorContext);
+      }
+      if (['held', 'paused'].includes(source.status)) break;
+    }
+    if (source.status === 'ready' && !source.links.some((link) => link.status === 'ready'
+      && (!link.plan || link.plan.items.some((item) => item.status === 'ready' || item.status === 'held')))) source.status = 'settled';
+    if (!input.control || input.control.canPersist()) store.saveRelaySource(source);
   };
 
-  const queueKey = JSON.stringify([message.groupId, sourceRequestKey(supportedUrl.url)]);
+  const queueKey = JSON.stringify([message.groupId, message.id]);
   if (queue) await queue.run(queueKey, runRelay);
   else await runRelay();
 }
 
-async function relayYouTube(input: HandleIncomingMessageInput, url: string, urlHash: string, errorContext: ErrorReportContext): Promise<void> {
+async function reportError(input: HandleIncomingMessageInput, error: unknown, context: ErrorReportContext): Promise<void> {
+  const text = messageForError(error, context);
+  if (input.control && !input.control.canSubmit()) return;
+  await input.whatsapp.sendText(input.message.groupId, text).catch((reportError: unknown) => { messageForError(reportError, context); });
+}
+
+export async function recoverRelaySources(input: RecoveryInput): Promise<void> {
+  const sources = input.store.listRelaySources();
+  for (const entry of sources) {
+    const run = async () => {
+      if (input.control && !input.control.canPersist()) return;
+      const source = input.store.getRelaySource(entry.groupId, entry.messageId)!;
+      for (const link of source.links) {
+        for (const item of link.plan?.items ?? []) {
+          if (!item.identity || item.status === 'skipped' || item.status === 'failed') continue;
+          const key = { groupId: source.groupId, messageId: source.messageId, identity: item.identity };
+          const attempt = input.store.getMediaAttempt(key);
+          if (attempt?.status === 'confirmed') { item.status = 'confirmed'; continue; }
+          if (attempt?.status !== 'sending' || !attempt.sentMessageId || attempt.sourceUrl !== link.url) continue;
+          const evidence = await input.whatsapp.lookupRepost(source.groupId, attempt.sentMessageId).catch(() => null);
+          if (input.control && !input.control.canPersist()) return;
+          if (!evidence || evidence.messageId !== attempt.sentMessageId || !confirmedEvidence(evidence)) continue;
+          if (input.store.getMediaAttempt(key)?.status !== 'confirmed') {
+            input.store.confirmMediaRepost(key, evidence, { groupId: source.groupId, senderId: source.senderId,
+              url: link.url, urlHash: link.urlHash, createdAtMs: processingNow(input) });
+          }
+          item.status = 'confirmed'; input.store.saveRelaySource(source);
+        }
+      }
+      if (source.status === 'settled' || source.status === 'held') return;
+      if (!checkpoint(input, source)) return;
+      const message = await input.whatsapp.getSourceMessage(source.groupId, source.messageId).catch(() => null);
+      if (input.control && !input.control.canPersist()) return;
+      if (!message || !message.isGroup || message.fromMe || message.groupId !== source.groupId || message.id !== source.messageId
+        || message.senderId !== source.senderId || hashUrl(message.body) !== source.contentHash) {
+        source.status = 'held'; source.holdReason = 'source-unavailable-or-changed';
+        input.store.saveRelaySource(source);
+        return;
+      }
+      await handleIncomingMessage({ ...input, queue: undefined, message: { ...message, senderName: source.senderName, timestampMs: source.timestampMs } });
+    };
+    try {
+      if (input.queue) await input.queue.run(JSON.stringify([entry.groupId, entry.messageId]), run);
+      else await run();
+    } catch (error) {
+      input.control?.failStorage();
+      throw error;
+    }
+  }
+}
+
+export function observeRelayAcknowledgement(input: Omit<HandleIncomingMessageInput, 'message'>, groupId: string, evidence: RepostConfirmation): void {
+  if (!confirmedEvidence(evidence) || (input.control && !input.control.canPersist())) return;
+  for (const source of input.store.listRelaySources()) {
+    if (source.groupId !== groupId) continue;
+    for (const link of source.links) {
+      for (const item of link.plan?.items ?? []) {
+        if (!item.identity) continue;
+        const key = { groupId, messageId: source.messageId, identity: item.identity };
+        const attempt = input.store.getMediaAttempt(key);
+        if (attempt?.status !== 'sending' || attempt.sentMessageId !== evidence.messageId || attempt.sourceUrl !== link.url) continue;
+        input.store.confirmMediaRepost(key, evidence, { groupId, senderId: source.senderId,
+          url: link.url, urlHash: link.urlHash, createdAtMs: processingNow(input) });
+      }
+    }
+  }
+}
+
+async function relayYouTube(input: ActiveInput, url: string, urlHash: string, errorContext: ErrorReportContext): Promise<void> {
   const { message, store, downloader } = input;
   if (!message.id.trim()) throw userError('YouTube relay needs a source message ID. Original message kept.');
+  if (input.link.plan?.items.every((item) => item.status === 'confirmed' || item.status === 'skipped' || item.status === 'failed')) return;
   const candidate = candidateMediaIdentity(url);
-  if (candidate) {
+  if (candidate?.platform === 'youtube') {
     const progress = store.getMediaDisposition({ groupId: message.groupId, messageId: message.id, identity: candidate },
       processingNow(input), store.getGroupSettings(message.groupId).duplicateWindowHours);
-    if (progress === 'completed' || progress === 'duplicate') return;
-    if (progress === 'held') throw unresolvedSendError('youtube');
+    if (progress !== 'ready') {
+      const plan: RelayPlan = { parentId: candidate.videoId, totalItems: 1, items: [{ index: 1, kind: 'video', identity: candidate, status: progress === 'completed' ? 'confirmed' : progress === 'duplicate' ? 'skipped' : 'held' }] };
+      if (!input.link.plan) input.link.plan = plan;
+      else input.link.plan.items[0].status = plan.items[0].status;
+      store.saveRelaySource(input.source);
+      if (progress === 'held') throw unresolvedSendError('youtube');
+      return;
+    }
   }
   errorContext.step = 'download';
   const video = await downloader.resolveYouTube(url).catch(() => {
+    if (!checkpoint(input, input.source)) return null;
+    input.link.status = 'failed'; store.saveRelaySource(input.source);
     throw userError('Could not establish this YouTube video identity. Original message kept.');
   });
+  if (!video || !checkpoint(input, input.source)) return;
   const key = { groupId: message.groupId, messageId: message.id, identity: { platform: 'youtube' as const, videoId: video.id } };
+  const plan: RelayPlan = { parentId: video.id, totalItems: 1, items: [{ index: 1, kind: 'video', identity: key.identity, status: 'ready' }] };
+  savePlan(input, plan);
+  const item = input.link.plan!.items[0];
   errorContext.step = 'duplicate-check';
   const progress = store.getMediaDisposition(key, processingNow(input), store.getGroupSettings(message.groupId).duplicateWindowHours);
-  if (progress === 'completed' || progress === 'duplicate') return;
-  if (progress === 'held') throw unresolvedSendError('youtube');
+  if (progress !== 'ready') {
+    item.status = progress === 'completed' ? 'confirmed' : progress === 'duplicate' ? 'skipped' : 'held';
+    store.saveRelaySource(input.source);
+    if (progress === 'held') throw unresolvedSendError('youtube');
+    return;
+  }
   errorContext.step = 'download';
   const download = await video.download(store.getGroupSettings(message.groupId).maxFileSizeMb).catch((error: unknown) => {
+    if (!checkpoint(input, input.source)) return null;
+    item.status = 'failed'; store.saveRelaySource(input.source);
     throw userError(`Could not download this video: ${safeDownloadMessage(error)} Original message kept.`);
   });
+  if (!download) return;
   await submitMedia(input, {
-    key, url, urlHash, download,
+    key, url, urlHash, download, item,
     unknownMessage: 'YouTube delivery is unknown. No automatic retry. Original message kept.',
   }, errorContext);
 }
 
-async function relayInstagram(input: HandleIncomingMessageInput, url: string, urlHash: string, errorContext: ErrorReportContext): Promise<void> {
+async function relayInstagram(input: ActiveInput, url: string, urlHash: string, errorContext: ErrorReportContext): Promise<void> {
   const { message, store, whatsapp, downloader } = input;
   if (!message.id.trim()) throw userError('Instagram relay needs a source message ID. Original message kept.');
+  if (input.link.plan?.items.every((item) => item.status === 'confirmed' || item.status === 'skipped' || item.status === 'failed')) return;
   errorContext.step = 'download';
   const source = await downloader.resolveInstagram(url).catch(() => {
+    if (!checkpoint(input, input.source)) return null;
+    input.link.status = 'failed'; store.saveRelaySource(input.source);
     throw userError('Could not inspect this Instagram post or selected item. Original message kept.');
   });
+  if (!source || !checkpoint(input, input.source)) return;
+  savePlan(input, { parentId: source.id, totalItems: source.totalItems, items: source.items.map((item) => ({
+    index: item.index, kind: item.kind, status: item.kind === 'video' ? 'ready' : 'skipped',
+    ...(item.kind === 'video' ? { identity: { platform: 'instagram' as const, postId: source.id, itemId: item.id } } : {}),
+  })) });
   let complete = true;
   let hasVideo = false;
   let skippedItems = false;
 
-  for (const item of source.items) {
+  for (const [position, item] of source.items.entries()) {
+    const savedItem = input.link.plan!.items[position];
     if (item.kind !== 'video') {
       skippedItems = true;
       continue;
     }
     hasVideo = true;
+    if (!checkpoint(input, input.source)) return;
+    if (savedItem.status === 'confirmed' || savedItem.status === 'skipped' || savedItem.status === 'failed') continue;
     const key = { groupId: message.groupId, messageId: message.id, identity: { platform: 'instagram' as const, postId: source.id, itemId: item.id } };
     errorContext.step = 'record';
     const progress = store.getMediaDisposition(key, processingNow(input), store.getGroupSettings(message.groupId).duplicateWindowHours);
-    if (progress === 'completed' || progress === 'duplicate') continue;
-    if (progress === 'held') throw unresolvedSendError('instagram');
+    if (progress !== 'ready') {
+      savedItem.status = progress === 'completed' ? 'confirmed' : progress === 'duplicate' ? 'skipped' : 'held';
+      store.saveRelaySource(input.source);
+      if (progress === 'held') throw unresolvedSendError('instagram');
+      continue;
+    }
 
     let download: Awaited<ReturnType<RelayDownloader['download']>>;
     try {
       errorContext.step = 'download';
       download = await item.download(store.getGroupSettings(message.groupId).maxFileSizeMb);
     } catch (error) {
+      if (!checkpoint(input, input.source)) return;
+      savedItem.status = 'failed'; store.saveRelaySource(input.source);
       complete = false;
       await whatsapp.sendText(message.groupId, `Could not download Instagram item ${item.index}: ${safeDownloadMessage(error)} Original message kept.`).catch((reportError: unknown) => {
         messageForError(reportError, errorContext);
@@ -192,20 +339,33 @@ async function relayInstagram(input: HandleIncomingMessageInput, url: string, ur
     }
 
     await submitMedia(input, {
-      key, url, urlHash, download,
+      key, url, urlHash, download, item: savedItem,
       captionSuffix: source.totalItems > 1 ? `\nInstagram item ${item.index} of ${source.totalItems}` : '',
       unknownMessage: `Instagram item ${item.index} delivery is unknown. No automatic retry. Original message kept.`,
     }, errorContext);
+    if (input.source.status === 'paused') return;
   }
 
-  if (skippedItems || !complete || !hasVideo) {
+  if ((!input.control || input.control.canSubmit()) && (skippedItems || !complete || !hasVideo)) {
     await whatsapp.sendText(message.groupId, hasVideo
       ? 'Photos or unresolved Instagram items were not reposted. Original message kept.'
       : 'No verifiable video in this Instagram post or selected item. Original message kept.');
   }
 }
 
+function savePlan(input: ActiveInput, plan: RelayPlan): void {
+  const signature = (value: RelayPlan) => JSON.stringify({ ...value, items: value.items.map(({ status: _status, ...item }) => item) });
+  if (input.link.plan && signature(input.link.plan) !== signature(plan)) {
+    input.source.status = 'held'; input.source.holdReason = 'media-changed';
+    input.store.saveRelaySource(input.source);
+    throw userError('Source media changed. Remaining work held. Original message kept.');
+  }
+  input.link.plan ??= plan;
+  input.store.saveRelaySource(input.source);
+}
+
 type MediaSubmission = {
+  item: RelayItem;
   key: MediaRepostKey;
   url: string;
   urlHash: string;
@@ -214,36 +374,86 @@ type MediaSubmission = {
   unknownMessage: string;
 };
 
-async function submitMedia(input: HandleIncomingMessageInput, submission: MediaSubmission, errorContext: ErrorReportContext): Promise<void> {
+async function submitMedia(input: ActiveInput, submission: MediaSubmission, errorContext: ErrorReportContext): Promise<void> {
   const { message, store, whatsapp, timezone, downloadDir, cleanupPath } = input;
   const { key, url, urlHash, download, captionSuffix, unknownMessage } = submission;
   try {
-    const settings = store.getGroupSettings(message.groupId);
-    if (!settings.enabled) throw userError(key.identity.platform === 'instagram'
-      ? 'Bot disabled. Remaining Instagram items were not reposted. Original message kept.'
-      : 'Bot disabled. Video was not reposted. Original message kept.');
+    if (!checkpoint(input, input.source)) return;
     const caption = formatCaption({ displayName: message.senderName, timestampMs: message.timestampMs, timezone, originalUrl: url }) + (captionSuffix ?? '');
-    const limit = Math.min(settings.maxFileSizeMb, input.maxMediaSizeMb ?? 64);
     const file = await stat(download.filePath);
-    if (!Number.isSafeInteger(limit) || limit <= 0 || !file.isFile() || file.size === 0 || file.size > limit * 1024 * 1024) {
+    if (!checkpoint(input, input.source)) return;
+    const currentLimit = Math.min(store.getGroupSettings(message.groupId).maxFileSizeMb, input.maxMediaSizeMb ?? 64);
+    if (!Number.isSafeInteger(currentLimit) || currentLimit <= 0 || !file.isFile() || file.size === 0 || file.size > currentLimit * 1024 * 1024) {
+      submission.item.status = 'failed'; store.saveRelaySource(input.source);
       throw userError('Video no longer meets the current media size limit. Original message kept.');
     }
     errorContext.step = 'record';
     const record = { groupId: message.groupId, senderId: message.senderId, url, urlHash, createdAtMs: processingNow(input) };
-    const reservation = store.beginMediaRepost(key, record, settings.duplicateWindowHours);
-    if (reservation === 'completed' || reservation === 'duplicate') return;
-    if (reservation === 'held') throw unresolvedSendError(key.identity.platform);
+    const reservation = store.beginMediaRepost(key, record, store.getGroupSettings(message.groupId).duplicateWindowHours);
+    if (reservation !== 'started') {
+      submission.item.status = reservation === 'completed' ? 'confirmed' : reservation === 'duplicate' ? 'skipped' : 'held';
+      store.saveRelaySource(input.source);
+      if (reservation === 'held') throw unresolvedSendError(key.identity.platform);
+      return;
+    }
     errorContext.step = 'upload';
-    const confirmation = await (download.deliveryMode === 'document'
-      ? whatsapp.sendVideoOnce(message.groupId, download.filePath, caption, 'document')
-      : whatsapp.sendVideoOnce(message.groupId, download.filePath, caption)).catch(() => {
+    let observationError: unknown;
+    const observe = (evidence: RepostEvidence) => {
+      if (input.control && !input.control.canPersist()) return;
+      try {
+        errorContext.step = 'record';
+        const attempt = store.getMediaAttempt(key);
+        if (attempt?.status === 'confirmed' && attempt.sentMessageId === evidence.messageId) return;
+        store.recordMediaEvidence(key, evidence);
+        if (confirmedEvidence(evidence)) {
+          store.confirmMediaRepost(key, evidence, { ...record, createdAtMs: processingNow(input) });
+        }
+      } catch (error) {
+        input.control?.failStorage();
+        observationError = error;
+        throw error;
+      }
+    };
+    const sending = whatsapp.sendVideoOnce(message.groupId, download.filePath, caption,
+      download.deliveryMode === 'document' ? 'document' : undefined, observe);
+    const confirmation = await (input.control ? input.control.track(sending) : sending).catch((error: unknown) => {
+      if (input.control && !input.control.canPersist()) return null;
+      submission.item.status = 'held'; store.saveRelaySource(input.source);
+      if (observationError) throw observationError;
       throw userError(unknownMessage);
     });
+    if (!confirmation || (input.control && !input.control.canPersist())) return;
     errorContext.step = 'record';
-    store.confirmMediaRepost(key, confirmation, { ...record, createdAtMs: processingNow(input) });
+    if (!confirmedEvidence({ messageId: confirmation.messageId, ack: confirmation.ack })) {
+      if (confirmation.messageId.trim() && Number.isInteger(confirmation.ack) && confirmation.ack >= -1 && confirmation.ack <= 4) {
+        store.recordMediaEvidence(key, confirmation);
+      }
+      submission.item.status = 'held'; store.saveRelaySource(input.source);
+      throw userError(unknownMessage);
+    }
+    if (store.getMediaAttempt(key)?.status !== 'confirmed') observe(confirmation);
+    submission.item.status = 'confirmed'; store.saveRelaySource(input.source);
   } finally {
     await cleanupDownload(download, downloadDir, cleanupPath);
   }
+}
+
+function checkpoint(input: Pick<HandleIncomingMessageInput, 'control' | 'store' | 'now' | 'nowMs'>, source: RelaySource): boolean {
+  if (input.control && !input.control.canPersist()) return false;
+  const age = processingNow(input) - source.acceptedAtMs;
+  if (age < 0 || age > 24 * 60 * 60 * 1000) {
+    source.status = 'held'; source.holdReason = 'stale'; input.store.saveRelaySource(source);
+    return false;
+  }
+  if ((input.control && !input.control.canSubmit()) || !input.store.getGroupSettings(source.groupId).enabled) {
+    source.status = 'paused'; input.store.saveRelaySource(source);
+    return false;
+  }
+  return true;
+}
+
+function confirmedEvidence(evidence: RepostEvidence): evidence is RepostConfirmation {
+  return Boolean(evidence.messageId.trim()) && evidence.ack !== null && Number.isInteger(evidence.ack) && evidence.ack >= 1 && evidence.ack <= 4;
 }
 
 function unresolvedSendError(platform: MediaIdentity['platform']): Error {
@@ -251,6 +461,6 @@ function unresolvedSendError(platform: MediaIdentity['platform']): Error {
   return userError(`${name} video has an unresolved send. No automatic retry. Original message kept.`);
 }
 
-function processingNow(input: HandleIncomingMessageInput): number {
+function processingNow(input: Pick<HandleIncomingMessageInput, 'now' | 'nowMs'>): number {
   return input.now?.() ?? input.nowMs ?? Date.now();
 }

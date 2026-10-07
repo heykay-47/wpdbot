@@ -62,15 +62,15 @@ async function fixture(platform: 'youtube' | 'instagram' = 'youtube') {
 }
 
 describe('handleIncomingMessage', () => {
-  it('relays only the first supported source link, attributes its unchanged URL, and retains the source', async () => {
+  it('inspects supported links in appearance order, attributes unchanged URLs, and retains the source', async () => {
     const input = await fixture();
     input.message = { ...baseMessage, body: `${baseMessage.body} https://instagram.com/p/another/` };
 
     await handleIncomingMessage(input);
 
-    expect(input.inspectedUrls).toEqual(['https://www.youtube.com/shorts/AbCdEf123_-?utm_source=x']);
+    expect(input.inspectedUrls).toEqual(['https://www.youtube.com/shorts/AbCdEf123_-?utm_source=x', 'https://instagram.com/p/another/']);
     expect(input.whatsapp.sendVideoOnce).toHaveBeenCalledWith(baseMessage.groupId, input.artifacts[0],
-      'Sent by Mom at 08 Jun 2026, 7:42 PM IST\nOriginal: https://www.youtube.com/shorts/AbCdEf123_-?utm_source=x');
+      'Sent by Mom at 08 Jun 2026, 7:42 PM IST\nOriginal: https://www.youtube.com/shorts/AbCdEf123_-?utm_source=x', undefined, expect.any(Function));
     expect(input.whatsapp.sendVideo).not.toHaveBeenCalled();
     expect(input.whatsapp.deleteMessage).not.toHaveBeenCalled();
     expect(input.store.countReposts()).toBe(1);
@@ -85,7 +85,7 @@ describe('handleIncomingMessage', () => {
     });
     input.whatsapp.sendVideoOnce.mockRejectedValue(new Error('Unknown outcome'));
     await handleIncomingMessage(input);
-    expect(input.whatsapp.sendVideoOnce).toHaveBeenCalledWith(baseMessage.groupId, input.artifacts[0], expect.stringContaining('Sent by Mom'), 'document');
+    expect(input.whatsapp.sendVideoOnce).toHaveBeenCalledWith(baseMessage.groupId, input.artifacts[0], expect.stringContaining('Sent by Mom'), 'document', expect.any(Function));
     await handleIncomingMessage(input);
     expect(input.whatsapp.sendVideoOnce).toHaveBeenCalledOnce();
     expect(input.whatsapp.sendVideo).not.toHaveBeenCalled();

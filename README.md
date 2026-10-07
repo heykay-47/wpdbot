@@ -9,21 +9,32 @@ WhatsApp group media relay bot for personal use. It watches enabled WhatsApp gro
 - Downloads identified videos with `yt-dlp`, using `ffmpeg` where stream merging requires it.
 - Retains source messages for both platforms until the remaining cleanup safeguards are implemented.
 - Suppresses equivalent-video reposts per group, with durable protection for unresolved sends.
+- Tracks ordered multi-link work durably and resumes eligible interrupted work after restart.
 - Supports per-group enable/disable/status commands.
 - Runs as a Docker Compose service with persisted auth, cache, database, and download volumes.
 
 ### Equivalent links and safe sends
 
-- Supported URLs remain YouTube `/shorts/` and Instagram `/p/` or `/reel/` on the existing bare, `www`, and `m` hosts. Only the first supported source link in a message is processed in this implementation.
+- Supported URLs remain YouTube `/shorts/` and Instagram `/p/` or `/reel/` on the existing bare, `www`, and `m` hosts. Distinct supported links are processed in first-appearance order; exact repeated URLs require one request. Definite failures and held videos do not prevent unrelated later links while the client is usable. There is no cross-message FIFO guarantee.
 - Ordinary YouTube Shorts links with the same exact, case-sensitive video ID share an identity across accepted hostname aliases, HTTP/HTTPS, fragments, trailing slashes, and the already-recognized `utm_*`, `fbclid`, and `igsh` tracking parameters. Different uploads of the same footage are not detected as content duplicates.
 - Instagram video identities use the resolved parent-post and video-item IDs. Sharing item 3, then the whole collection, reposts only its other unconfirmed videos inside the window. Sharing the whole collection, then item 3, does not repost that video again inside the window. `/p/` versus `/reel/` alone does not identify one equal video.
 - Arbitrary queries, encoded/malformed IDs, unusual paths, long shortcode variants, and mobile Instagram links do not receive guessed equivalence. The submitted URL is kept for extraction and attribution. Verified metadata may establish an identity; otherwise no video is sent and the source remains visible. Fixture success does not prove mobile Instagram extraction works in a deployment.
 - A group's duplicate window starts when a repost's confirmation is observed, not when its source was posted or queued. Duplicate skips do not extend it. A new source message may request another repost after expiry. Confirmed outcomes for the same source message remain completed even after expiry or restart. Queued work rechecks current settings and time.
-- Both platforms prepare media before making one submission attempt. There are no transcode or document retries after submission begins. Confirmation requires a sent-message ID and an observed server-or-stronger acknowledgement in the originating group. It does not prove every participant received the repost.
+- Both platforms prepare media before making one submission attempt. There are no transcode or document retries after submission begins. Confirmation requires a sent-message ID and an observed server-or-stronger acknowledgement in the originating group. A send waits at most 30 seconds for that evidence. Timeout does not cancel the external effect or prove failure. It does not prove every participant received the repost.
 - Identity-based send reservations are stored before submission. An unresolved send blocks that video across source messages and restarts, regardless of duplicate-window expiry. A definite inspection/download failure does not create a confirmed duplicate marker. A submitted video whose confirmation cannot be recorded remains held rather than being sent again.
-- All source messages remain intact, including document reposts, duplicate-only and mixed new/duplicate requests. General reconciliation, authorized retry commands, and guarded source cleanup remain later work. Do not erase progress records to force another send.
+- All source messages remain intact, including document reposts, duplicate-only and mixed new/duplicate requests. Exact-ID reconciliation is supported; authorized recovery commands and guarded source cleanup remain later work. Do not erase progress records to force another send.
 
 SQLite initialization adds `media_relay_attempts` without rewriting existing settings, history, URL hashes, or `instagram_relay_items`. Legacy URL markers still suppress only their exact legacy-normalized URL in the same group/window; they are not promoted to ACK-confirmed identities or broadened to aliases. Old Instagram confirmations still protect the same source message, and old unresolved items protect the same resolved video across messages. Old records have no reliable confirmation timestamp, so no canonical windows are backfilled. A newly encountered URL alias can therefore be reposted despite an old URL-only marker.
+
+### Durable work and restart recovery
+
+- SQLite also adds versioned `relay_sources` snapshots. Intake persists the source/group IDs, attribution, timestamps, supported URLs, a content fingerprint and ordered link outcomes before queueing. Resolved video identities and positions are stored before downloading. Surrounding prose, credentials and raw extraction responses are not stored in this new table. The database still contains private URLs and attribution and must remain private.
+- Startup waits for the WhatsApp client to be ready and recovers only previously accepted work. It does not scan group history for messages posted while offline. Pre-send work can download and prepare again; leftover temporary files are not trusted as resumable downloads.
+- Before recovered sends, require the source to exist unchanged in its originating group. Missing, changed or unavailable sources stay held. Re-inspection must match saved collection identities/order; a changed plan stays held rather than substituting videos. Work older than 24 hours from acceptance, or with a future acceptance timestamp after clock rollback, requires authorized review. Age never expires confirmation records or unknown-delivery protection.
+- Same-source confirmed and duplicate-skipped outcomes remain completed. Recorded inspection/download/preparation failures are not automatically retried on restart or repeated source events. A new source message can request a video again after a definite pre-send failure, subject to current duplicate and unresolved-send guards. No retry/review command exists yet.
+- Send intent is committed before submission. A crash between that write and submission is conservatively held even if no send actually happened. Known repost IDs are stored immediately, including pending ACKs. Exact-ID lookup and later ACK events can establish positive confirmation in the originating group. Absent history, a failed lookup or no stored ID never establishes non-delivery and never authorizes another send. Legacy holds remain guards; no old queue or missing evidence is reconstructed.
+- Disabling a group pauses unsubmitted work without clearing outcomes. An already-started send may still record its evidence. Re-enabling makes paused work eligible under current settings and the source/age checks; it does not reset failures, confirmations or holds. A storage failure stops new submissions until the process is restarted and storage is repaired.
+- `SIGINT` and `SIGTERM` stop intake and new submissions immediately. Active submissions have up to 30 seconds to record evidence, then the client is destroyed and SQLite closed without logout or auth deletion. Compose allows 35 seconds before forced termination. Abrupt loss still relies on durable send-intent guards; shutdown does not provide exactly-once delivery.
 
 A zero-hour stored group window disables prior-message confirmed suppression, not unresolved-send protection or same-source completion. Existing `.env` validation still requires a positive `DUPLICATE_WINDOW_HOURS`; new group-setting commands and ranges are not part of this change. Back up the database before updating a deployment, and do not run old and new relay versions against the same database concurrently.
 
@@ -33,7 +44,7 @@ A zero-hour stored group window disables prior-message confirmed suppression, no
 - A source link with `img_index=3` requests only the third media item, counting photos as positions too. An invalid, unavailable, or non-video selection does not fall back to another video.
 - A failed item download or media preparation does not prevent other verifiable videos from being processed. Each video must meet the effective media budget; configured duration limits also apply to the probed final file.
 - Instagram source messages are always retained, including fully reposted single-video posts. Safe automatic cleanup awaits the remaining restart-recovery and deletion-guard work.
-- Unresolved sends stop the collection. There is no automatic reconciliation or recovery command yet. Do not erase progress records to force a retry; review the group first because the video may already be present.
+- Unresolved sends stop that collection, not unrelated later links. Exact stored repost IDs may be reconciled, but there is no authorized recovery command yet. Do not erase progress records to force a retry; review the group first because the video may already be present.
 
 Metadata handling is conservative when yt-dlp omits entries or cannot establish their positions. Its deployed version is not pinned by this project, so fixture-based checks do not replace a separately authorized private-group smoke test.
 
@@ -245,6 +256,8 @@ PUPPETEER_EXECUTABLE_PATH=/path/to/chrome npm run test:browser
 ```
 
 This check launches and shuts down the real WhatsApp client browser with a temporary profile and intercepts page requests with fixture HTML. It does not contact WhatsApp, log in, or send messages. The manual smoke test below is still needed to verify live relaying.
+
+Recovery tests include disposable SQLite databases, synthetic metadata/media, mocked WhatsApp, actual child-process kills at intake/plan/send-intent/evidence/confirmation boundaries, and real SIGINT/SIGTERM handling with a mocked client. These checks do not prove live WhatsApp history availability, recipient playback or delivery.
 
 ## Troubleshooting
 

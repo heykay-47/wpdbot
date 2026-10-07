@@ -70,17 +70,24 @@ export function normalizeUrlForDuplicate(value: string): string {
 }
 
 export function extractFirstSupportedUrl(body: string): ExtractedUrl | null {
+  return extractSupportedUrls(body)[0] ?? null;
+}
+
+export function extractSupportedUrls(body: string): ExtractedUrl[] {
+  const links: ExtractedUrl[] = [];
+  const seen = new Set<string>();
   for (const match of body.matchAll(URL_PATTERN)) {
     const candidate = trimUrlCandidate(match[0]);
     const extractor = extractorForUrl(candidate);
-    if (!extractor) continue;
+    if (!extractor || seen.has(candidate)) continue;
 
-    return {
+    seen.add(candidate);
+    links.push({
       extractorId: extractor.id,
       platform: extractor.id,
       url: candidate,
-    };
+    });
   }
 
-  return null;
+  return links;
 }
