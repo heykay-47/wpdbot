@@ -22,7 +22,8 @@ ENV NODE_ENV=production \
     SQLITE_PATH=/data/bot.db \
     DOWNLOAD_DIR=/tmp/wpdbot-downloads \
     WHATSAPP_AUTH_DIR=/app/.wwebjs_auth \
-    WHATSAPP_CACHE_DIR=/app/.wwebjs_cache
+    WHATSAPP_CACHE_DIR=/app/.wwebjs_cache \
+    DIAGNOSTICS_DIR=/app/.diagnostics
 
 WORKDIR /app
 
@@ -66,4 +67,4 @@ RUN chown -R wpdbot:wpdbot /app
 
 USER wpdbot
 
-CMD ["npm", "start"]
+CMD ["node", "dist/entrypoint.js"]

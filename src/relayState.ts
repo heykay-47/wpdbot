@@ -20,6 +20,7 @@ export type RelayLink = {
 
 export type RelaySource = {
   version: 1;
+  workReference?: string;
   groupId: string;
   messageId: string;
   senderId: string;
@@ -33,7 +34,14 @@ export type RelaySource = {
   links: RelayLink[];
 };
 
+export class UnsupportedRelayStateError extends Error {}
+
 export function validateRelaySource(source: RelaySource): void {
+  try { validateSource(source); }
+  catch { throw new UnsupportedRelayStateError('Durable source state is invalid or unsupported'); }
+}
+
+function validateSource(source: RelaySource): void {
   if (!source || source.version !== 1 || source.cleanup !== 'retained'
     || !['ready', 'paused', 'held', 'settled'].includes(source.status)
     || ![source.groupId, source.messageId, source.senderId, source.senderName, source.contentHash].every((value) => typeof value === 'string' && value.length > 0)

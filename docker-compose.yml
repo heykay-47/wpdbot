@@ -2,6 +2,8 @@ services:
   bgutil-provider:
     image: brainicism/bgutil-ytdlp-pot-provider:latest
     restart: unless-stopped
+    logging:
+      driver: "none"
 
   wpdbot:
     build: .
@@ -14,6 +16,8 @@ services:
       WHATSAPP_CACHE_DIR: /app/.wwebjs_cache
     restart: unless-stopped
     stop_grace_period: 35s
+    logging:
+      driver: "none"
     depends_on:
       - bgutil-provider
     volumes:

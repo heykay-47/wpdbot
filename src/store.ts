@@ -1,8 +1,9 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import Database from 'better-sqlite3';
 import { mediaIdentityKey, type MediaIdentity } from './mediaIdentity.js';
-import { validateRelaySource, type RelaySource } from './relayState.js';
+import { UnsupportedRelayStateError, validateRelaySource, type RelaySource } from './relayState.js';
 
 export type GroupSettings = {
   groupId: string;
@@ -172,12 +173,39 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
       state_json TEXT NOT NULL,
       PRIMARY KEY (group_id, message_id)
     );
+    CREATE TABLE IF NOT EXISTS relay_references (
+      group_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      reference TEXT NOT NULL UNIQUE,
+      PRIMARY KEY (group_id, message_id)
+    );
   `);
 
   const insertRelaySource = db.prepare('INSERT OR IGNORE INTO relay_sources (group_id, message_id, state_json) VALUES (?, ?, ?)');
   const selectRelaySource = db.prepare<[string, string], { state: string }>('SELECT state_json AS state FROM relay_sources WHERE group_id = ? AND message_id = ?');
   const updateRelaySource = db.prepare('UPDATE relay_sources SET state_json = ? WHERE group_id = ? AND message_id = ?');
-  const selectRelaySources = db.prepare<[], { state: string }>('SELECT state_json AS state FROM relay_sources ORDER BY rowid');
+  const selectRelaySources = db.prepare<[], { groupId: string; messageId: string; state: string }>('SELECT group_id AS groupId, message_id AS messageId, state_json AS state FROM relay_sources ORDER BY rowid');
+  const insertReference = db.prepare('INSERT OR IGNORE INTO relay_references (group_id, message_id, reference) VALUES (?, ?, ?)');
+  const selectReference = db.prepare<[string, string], { reference: string }>('SELECT reference FROM relay_references WHERE group_id = ? AND message_id = ?');
+  const ensureReference = (groupId: string, messageId: string) => {
+    while (!selectReference.get(groupId, messageId)) insertReference.run(groupId, messageId, `W-${randomBytes(16).toString('hex').toUpperCase()}`);
+    return selectReference.get(groupId, messageId)!.reference;
+  };
+  const readSource = (state: string, groupId: string, messageId: string): RelaySource => {
+    let source: RelaySource;
+    try { source = JSON.parse(state) as RelaySource; }
+    catch { throw new UnsupportedRelayStateError('Durable source state is invalid or unsupported'); }
+    validateRelaySource(source);
+    if (source.groupId !== groupId || source.messageId !== messageId) throw new UnsupportedRelayStateError('Durable source identity does not match its record');
+    return { ...source, workReference: ensureReference(groupId, messageId) };
+  };
+  const acceptSource = db.transaction((source: RelaySource) => {
+    validateRelaySource(source);
+    const existing = selectRelaySource.get(source.groupId, source.messageId);
+    if (existing) { readSource(existing.state, source.groupId, source.messageId); return; }
+    insertRelaySource.run(source.groupId, source.messageId, JSON.stringify(source));
+    ensureReference(source.groupId, source.messageId);
+  });
 
   const insertDefaultSettings = db.prepare(`
     INSERT OR IGNORE INTO group_settings (group_id, enabled, max_file_size_mb, duplicate_window_hours)
@@ -322,17 +350,13 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
 
   return {
     acceptRelaySource(source) {
-      validateRelaySource(source);
-      insertRelaySource.run(source.groupId, source.messageId, JSON.stringify(source));
+      acceptSource(source);
     },
 
     getRelaySource(groupId, messageId) {
       const row = selectRelaySource.get(groupId, messageId);
       if (!row) return null;
-      const source = JSON.parse(row.state) as RelaySource;
-      validateRelaySource(source);
-      if (source.groupId !== groupId || source.messageId !== messageId) throw new Error('Durable source identity does not match its record');
-      return source;
+      return readSource(row.state, groupId, messageId);
     },
 
     saveRelaySource(source) {
@@ -343,11 +367,18 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
     },
 
     listRelaySources() {
-      return selectRelaySources.all().map((row) => {
-        const source = JSON.parse(row.state) as RelaySource;
-        validateRelaySource(source);
-        return source;
-      });
+      const sources: RelaySource[] = [];
+      for (const row of selectRelaySources.all()) {
+        // Unsupported/corrupt records remain untouched, never submitted, and cannot block valid work.
+        let source: RelaySource;
+        try {
+          source = JSON.parse(row.state) as RelaySource;
+          validateRelaySource(source);
+          if (source.groupId !== row.groupId || source.messageId !== row.messageId) continue;
+        } catch { continue; }
+        sources.push({ ...source, workReference: ensureReference(row.groupId, row.messageId) });
+      }
+      return sources;
     },
 
     getGroupSettings(groupId) {

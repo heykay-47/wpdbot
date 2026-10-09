@@ -1,10 +1,11 @@
-export type BotCommand = { action: 'enable' | 'disable' | 'status' };
+export type BotCommand = { action: 'enable' | 'disable' | 'status' | 'inspect' };
 
 export function parseCommand(body: string): BotCommand | null {
   const normalized = body.trim().toLowerCase();
   if (normalized === '!bot enable') return { action: 'enable' };
   if (normalized === '!bot disable') return { action: 'disable' };
   if (normalized === '!bot status') return { action: 'status' };
+  if (normalized === '!bot inspect') return { action: 'inspect' };
   return null;
 }
 

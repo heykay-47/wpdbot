@@ -8,8 +8,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "dev": "tsx src/index.ts",
-    "start": "node dist/index.js",
+    "dev": "tsx src/entrypoint.ts",
+    "start": "node dist/entrypoint.js",
     "test": "vitest run",
     "test:browser": "npm run build && node --test tests/whatsapp-browser.test.mjs",
     "test:watch": "vitest"

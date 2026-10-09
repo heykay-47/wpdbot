@@ -1,5 +1,6 @@
 import { rm, stat } from 'node:fs/promises';
 import { extname } from 'node:path';
+import { userError } from './errorReporter.js';
 
 export type MediaRunner = (file: string, args: string[], timeoutMs: number) => Promise<{ stdout: string }>;
 export type PreparedMedia = { filePath: string; sizeBytes: number; deliveryMode: 'video' | 'document' };
@@ -11,7 +12,7 @@ async function inspect(filePath: string, maxFileSizeMb: number, runner: MediaRun
   if (!Number.isSafeInteger(maxFileSizeMb) || maxFileSizeMb <= 0) throw new Error('Media size limit is invalid');
   const file = await stat(filePath);
   if (!file.isFile() || file.size === 0) throw new Error('Video output is empty or unavailable');
-  if (file.size > maxFileSizeMb * 1024 * 1024) throw new Error(`Downloaded file exceeds ${maxFileSizeMb} MB`);
+  if (file.size > maxFileSizeMb * 1024 * 1024) throw userError(`Downloaded file exceeds ${maxFileSizeMb} MB`, 'size_limit');
   const { stdout } = await runner('ffprobe', ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', filePath], 30_000);
   const probe = JSON.parse(stdout) as { format?: { format_name?: string; duration?: string; tags?: { major_brand?: string } }; streams?: Stream[] };
   if (!Array.isArray(probe.streams)) throw new Error('Video streams are unavailable');
@@ -27,7 +28,7 @@ async function inspect(filePath: string, maxFileSizeMb: number, runner: MediaRun
   const duration = videoDurationKnown && durations.length ? Math.max(...durations) : undefined;
   if (maxDurationSeconds !== undefined) {
     if (duration === undefined) throw new Error('Video duration is unavailable');
-    if (duration > maxDurationSeconds) throw new Error(`Video exceeds ${maxDurationSeconds} seconds`);
+    if (duration > maxDurationSeconds) throw userError(`Video exceeds ${maxDurationSeconds} seconds`, 'duration_limit');
   }
   const [numerator, denominator] = (video.avg_frame_rate ?? '').split('/').map(Number);
   const fps = numerator / denominator;

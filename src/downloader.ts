@@ -3,6 +3,7 @@ import { isAbsolute, join, relative } from 'node:path';
 import { execa } from 'execa';
 import { candidateMediaIdentity, isYouTubeVideoId } from './mediaIdentity.js';
 import { prepareMedia } from './mediaPreparation.js';
+import { userError } from './errorReporter.js';
 
 export type DownloaderRunner = (file: string, args: string[], timeoutMs?: number) => Promise<{ stdout: string }>;
 
@@ -58,7 +59,7 @@ async function assertDurationAllowed(runner: DownloaderRunner, url: string, opti
   const { stdout } = await runner('yt-dlp', args);
   const metadata = JSON.parse(stdout.trim().split(/\r?\n/).at(-1) || '{}') as { duration?: number };
   if (typeof metadata.duration === 'number' && metadata.duration > options.maxDurationSeconds) {
-    throw new Error(`Video exceeds ${options.maxDurationSeconds} seconds`);
+    throw userError(`Video exceeds ${options.maxDurationSeconds} seconds`, 'duration_limit');
   }
 }
 
@@ -179,7 +180,7 @@ export function createDownloader({ downloadDir, runner = defaultRunner, options 
 
         const { size } = await stat(filePath);
         if (size > maxFileSizeMb * 1024 * 1024) {
-          throw new Error(`Downloaded file exceeds ${maxFileSizeMb} MB`);
+          throw userError(`Downloaded file exceeds ${maxFileSizeMb} MB`, 'size_limit');
         }
 
         const prepared = await prepareMedia(filePath, maxFileSizeMb, runner, options.maxDurationSeconds);
@@ -205,7 +206,7 @@ function hasVideoFormats(metadata: Record<string, unknown>): boolean {
 async function downloadResolvedVideo(metadata: Record<string, unknown>, maxFileSizeMb: number, downloadDir: string, runner: DownloaderRunner, options: DownloadOptions, platform: string): Promise<DownloaderResult> {
   maxFileSizeMb = Math.min(maxFileSizeMb, options.maxMediaSizeMb ?? 64);
   if (options.maxDurationSeconds && typeof metadata.duration === 'number' && metadata.duration > options.maxDurationSeconds) {
-    throw new Error(`Video exceeds ${options.maxDurationSeconds} seconds`);
+    throw userError(`Video exceeds ${options.maxDurationSeconds} seconds`, 'duration_limit');
   }
   await mkdir(downloadDir, { recursive: true });
   const tempDir = await mkdtemp(join(downloadDir, 'download-'));
@@ -231,7 +232,7 @@ async function downloadResolvedVideo(metadata: Record<string, unknown>, maxFileS
     if (!localPath || localPath.startsWith('..') || isAbsolute(localPath)) throw new Error(`${platform} output is outside its download directory`);
     const file = await stat(filePath);
     if (!file.isFile() || !file.size) throw new Error(`${platform} video output is empty or unavailable`);
-    if (file.size > maxFileSizeMb * 1024 * 1024) throw new Error(`Downloaded file exceeds ${maxFileSizeMb} MB`);
+    if (file.size > maxFileSizeMb * 1024 * 1024) throw userError(`Downloaded file exceeds ${maxFileSizeMb} MB`, 'size_limit');
     await rm(infoPath, { force: true });
     const prepared = await prepareMedia(filePath, maxFileSizeMb, runner, options.maxDurationSeconds);
     return { ...prepared, tempDir };

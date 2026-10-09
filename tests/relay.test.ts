@@ -131,7 +131,7 @@ describe('handleIncomingMessage', () => {
     input.message = { ...baseMessage, id: '' };
     await handleIncomingMessage(input);
     expect(input.whatsapp.sendVideoOnce).not.toHaveBeenCalled();
-    expect(input.whatsapp.sendText).toHaveBeenCalledWith(baseMessage.groupId, 'YouTube relay needs a source message ID. Original message kept.');
+    expect(input.whatsapp.sendText).toHaveBeenCalledWith(baseMessage.groupId, expect.stringContaining('Work reference unavailable'));
   });
 
   it('uses injected file cleanup without deleting the source message', async () => {
@@ -165,37 +165,37 @@ describe('handleIncomingMessage', () => {
     input.failures[step] = true;
     await handleIncomingMessage(input);
     expect(input.whatsapp.sendVideoOnce).not.toHaveBeenCalled();
-    expect(input.whatsapp.sendText).toHaveBeenCalledWith(baseMessage.groupId, step === 'inspection'
-      ? 'Could not establish this YouTube video identity. Original message kept.'
-      : 'Could not download this video: Download unavailable or blocked. Original message kept.');
+    expect(input.whatsapp.sendText).toHaveBeenCalledWith(baseMessage.groupId, expect.stringContaining('cause could not be verified'));
+    expect(input.logs[0]).toMatchObject({ stage: 'download', cause: 'unknown', reference: expect.stringMatching(/^W-[A-F0-9]{32}$/u) });
     expect(input.store.countReposts()).toBe(0);
     expect(input.whatsapp.deleteMessage).not.toHaveBeenCalled();
   });
 
-  it('logs an unexpected settings error with its source context and a safe group error ID', async () => {
+  it('logs an unexpected settings error without private source context or an invented reference', async () => {
     const input = await fixture();
-    vi.spyOn(input.store, 'getGroupSettings').mockImplementationOnce(() => { throw new Error('database exploded'); });
+    vi.spyOn(input.store, 'getGroupSettings').mockImplementationOnce(() => { throw Object.assign(new Error('private database failure'), { code: 'SQLITE_IOERR' }); });
     await handleIncomingMessage(input);
-    expect(input.whatsapp.sendText).toHaveBeenCalledWith(baseMessage.groupId, expect.stringMatching(/^Something went wrong\. Error ID: ERR-[0-9A-F]{6}$/u));
-    expect(input.logs[0]).toMatchObject({ step: 'settings', groupId: baseMessage.groupId, messageId: baseMessage.id, extractorId: 'youtube' });
+    expect(input.whatsapp.sendText).toHaveBeenCalledWith(baseMessage.groupId, expect.stringContaining('storage failed'));
+    expect(input.logs[0]).toMatchObject({ stage: 'settings', cause: 'storage_failed', platform: 'youtube' });
+    expect(input.logs[0]).not.toHaveProperty('groupId');
+    expect(input.logs[0]).not.toHaveProperty('reference');
   });
 
-  it('keeps upload-error reporting failures scoped to the upload and source URL fingerprint', async () => {
+  it('keeps upload-error reporting failures safe and separate from evidence', async () => {
     const input = await fixture();
     input.whatsapp.sendVideoOnce.mockRejectedValueOnce(new Error('session=secret'));
     input.whatsapp.sendText.mockRejectedValueOnce(new Error('Reporting unavailable'));
     await handleIncomingMessage(input);
-    expect(input.logs[0]).toMatchObject({ step: 'upload', groupId: baseMessage.groupId, messageId: baseMessage.id,
-      extractorId: 'youtube', urlHash: expect.stringMatching(/^[0-9a-f]{64}$/u) });
+    expect(input.logs[0]).toMatchObject({ stage: 'upload', cause: 'delivery_unknown', platform: 'youtube', reference: expect.stringMatching(/^W-[A-F0-9]{32}$/u) });
+    expect(input.logs[1]).toMatchObject({ stage: 'notification' });
     expect(input.whatsapp.sendVideo).not.toHaveBeenCalled();
   });
 
   it('logs confirmation-storage failure without deleting the source or initiating another send', async () => {
     const input = await fixture();
-    vi.spyOn(input.store, 'confirmMediaRepost').mockImplementationOnce(() => { throw new Error('database locked'); });
+    vi.spyOn(input.store, 'confirmMediaRepost').mockImplementationOnce(() => { throw Object.assign(new Error('private database failure'), { code: 'SQLITE_BUSY' }); });
     await handleIncomingMessage(input);
-    expect(input.logs[0]).toMatchObject({ step: 'record', groupId: baseMessage.groupId, messageId: baseMessage.id,
-      extractorId: 'youtube', urlHash: expect.stringMatching(/^[0-9a-f]{64}$/u) });
+    expect(input.logs[0]).toMatchObject({ stage: 'record', cause: 'storage_failed', platform: 'youtube', reference: expect.stringMatching(/^W-[A-F0-9]{32}$/u) });
     expect(input.whatsapp.sendVideoOnce).toHaveBeenCalledOnce();
     expect(input.whatsapp.deleteMessage).not.toHaveBeenCalled();
     expect(input.store.countReposts()).toBe(0);

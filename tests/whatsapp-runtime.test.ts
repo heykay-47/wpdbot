@@ -131,7 +131,7 @@ describe('prepareWhatsappRuntime', () => {
     expect(existsSync(sibling)).toBe(true);
   });
 
-  it('logs removed lock files without logging profile contents', async () => {
+  it('does not emit operational profile details to ordinary logs', async () => {
     const info = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     const root = tempRoot();
     const paths = resolveWhatsappRuntimePaths({ authDir: join(root, 'auth'), cacheDir: join(root, 'cache') });
@@ -141,6 +141,6 @@ describe('prepareWhatsappRuntime', () => {
 
     await prepareWhatsappRuntime(paths);
 
-    expect(info).toHaveBeenCalledWith('Removed stale Chromium profile locks: SingletonLock');
+    expect(info).not.toHaveBeenCalled();
   });
 });

@@ -10,7 +10,7 @@ WhatsApp group media relay bot for personal use. It watches enabled WhatsApp gro
 - Retains source messages for both platforms until the remaining cleanup safeguards are implemented.
 - Suppresses equivalent-video reposts per group, with durable protection for unresolved sends.
 - Tracks ordered multi-link work durably and resumes eligible interrupted work after restart.
-- Supports per-group enable/disable/status commands.
+- Supports authorized per-group enable/disable/status/inspect commands.
 - Runs as a Docker Compose service with persisted auth, cache, database, and download volumes.
 
 ### Equivalent links and safe sends
@@ -107,15 +107,15 @@ Node 24 is the supported runtime for local development and Docker. Node 20 is no
    CONCURRENT_DOWNLOADS=1
    ```
 
-4. Build and start the bot:
+4. Build the bot and stop its normal service before private login:
 
    ```sh
-   docker compose build
-   docker compose up -d
-   docker compose logs -f
+    docker compose build
+    docker compose stop wpdbot
+    docker compose run --rm --no-deps wpdbot node dist/entrypoint.js login
    ```
 
-5. Scan the QR code shown in logs.
+5. Scan the QR in that private interactive terminal, then run `docker compose up -d`. Never record/share the terminal. The one-shot flow exits after authentication, timeout or interruption; it does not relay. A noninteractive invocation refuses to expose a QR. The daemon never prints one.
 
 6. Add the bot WhatsApp account to the target group and make it a group admin.
 
@@ -142,6 +142,7 @@ Configure the bot with `.env`.
 | `DOWNLOAD_DIR` | `/tmp/wpdbot-downloads` | Temporary download directory. |
 | `WHATSAPP_AUTH_DIR` | Docker: `/app/.wwebjs_auth` | Optional WhatsApp auth directory override. Usually leave unset outside Docker. |
 | `WHATSAPP_CACHE_DIR` | Docker: `/app/.wwebjs_cache` | Optional WhatsApp cache directory override. Usually leave unset outside Docker. |
+| `DIAGNOSTICS_DIR` | Docker: `/app/.diagnostics`; local: `.diagnostics` | Private, regenerable allowlisted diagnostics, bounded to seven days and 30 MiB total. Keep separate from database/auth volumes. |
 | `MAX_DURATION_SECONDS` | empty | Optional global maximum video duration in seconds, checked against known metadata and the probed final file. Unknown final duration rejects when configured. Leave empty to disable the limit. |
 | `YT_DLP_COOKIES_PATH` | empty | Optional path to a private Netscape cookies file for authenticated `yt-dlp` downloads. Never commit this file; mount it as a secret/volume and do not `COPY` it into a Docker image. |
 | `YT_DLP_PROXY` | empty | Optional proxy URL passed to `yt-dlp` for network or region workarounds. |
@@ -158,8 +159,26 @@ Commands are sent in WhatsApp group chat.
 | `!bot enable` | Enables relay for the current group. The bot must be a group admin. |
 | `!bot disable` | Disables relay for the current group. |
 | `!bot status` | Shows enabled state, max size, duplicate window, supported platforms, and bot admin status. |
+| `!bot inspect` | Bounded unfinished-work summary for this group (up to ten sources), also while disabled. |
+| Reply to a source with `!bot inspect` | Saved link/item outcomes for that exact tracked source (up to twenty positions). Missing, foreign or untracked quotes show no work details. |
 
 Only group admins or the configured bot owner can manage the bot.
+
+Every durably accepted source has a persistent random `W-…` reference. Equivalent links in different sources have different references; references grant no access. A settled source may still have failed items. Inspection uses saved outcomes and exact stored attempt evidence, not guessed historical causes/counts/times. Unsupported saved records remain untouched and held, without blocking unrelated supported recovery. No targeted retry, settings change or cleanup command is implemented in Stage 1.
+
+### Private diagnostics and login
+
+Ordinary Docker output is disabled for the bot and token-provider containers. The daemon also discards third-party stdout/stderr; unexpected errors never fall back to raw messages/stacks. Operator diagnostics are JSONL files with allowlisted stage, timestamp, safe cause, platform, opaque reference and saved positions. No source URLs/hashes, identities, raw IDs, prose, stderr, commands, paths, payloads, secrets or QR data are included. Expected failures are logged too; unknown causes remain unknown. Reporter failure never changes delivery evidence or authorizes another send.
+
+Read only the bounded private diagnostics in the running container:
+
+```sh
+docker compose exec wpdbot sh -c 'cat /app/.diagnostics/*.jsonl'
+```
+
+Files rotate at 1 MiB, evict oldest entries before exceeding 30 MiB total, and expire conservatively within seven days while running (including idle maintenance). Startup prunes expired/oversized files before use. Container recreation discards these regenerable diagnostics, not durable data. Do not persist them in SQLite/auth volumes or use Docker log overrides to capture raw output. Never upload diagnostics automatically. Public support should contain synthetic examples only, not private database/auth/cache files or terminal recordings.
+
+For authentication intervention, stop `wpdbot`, invoke the private one-shot login command above against the same auth volume, then start `wpdbot`. A shared OS-backed auth-profile lock prevents this version's daemon and login process from running together and releases on process exit. Never run an older version concurrently or automatically logout/delete/relink the session. Health/readiness, portable cookies and the full paired backup/restore runbook remain Stage 4 work.
 
 ## Operations
 
@@ -167,7 +186,7 @@ Common Docker commands:
 
 ```sh
 docker compose up -d        # Start in background
-docker compose logs -f      # Follow logs and QR/login output
+docker compose exec wpdbot sh -c 'cat /app/.diagnostics/*.jsonl' # Private safe diagnostics
 docker compose restart      # Restart service
 docker compose down         # Stop without deleting volumes
 docker compose build        # Rebuild image
@@ -182,7 +201,6 @@ git checkout master
 git pull --ff-only origin master
 docker compose build --pull
 docker compose up -d
-docker compose logs -f
 ```
 
 If the server has local changes, inspect and save them before pulling:
@@ -300,7 +318,7 @@ After pulling, reapply only the changes you still need.
 
 ### YouTube Shorts Fail With "Download Unavailable Or Blocked" On A Cloud Server
 
-YouTube enforces PO (Proof of Origin) Token authentication and may return `LOGIN_REQUIRED` for requests from datacenter or cloud IPs (DigitalOcean, AWS, GCP, etc.) even when a PO token is provided. Inspection failures now produce "Could not establish this YouTube video identity. Original message kept." Download failures produce "Could not download this video: Download unavailable or blocked. Original message kept." These user-facing errors still bypass diagnostic logging; richer diagnostics remain later work.
+YouTube can enforce PO (Proof of Origin) Token authentication or require source access. Failures now produce safe group feedback and allowlisted diagnostics. An unspecified upstream exception remains an unknown cause; raw stderr is never shown or logged. Contact the operator rather than posting cookies, URLs, raw errors or credentials into support.
 
 Two things must be in place for YouTube Shorts to work reliably from a cloud server:
 
@@ -313,17 +331,13 @@ docker compose build --no-cache
 docker compose up -d
 ```
 
-Verify the sidecar is running and the plugin is loaded:
+Verify the sidecar is running:
 
 ```sh
 docker ps                          # bgutil-provider should be Up
-docker exec wpdbot-wpdbot-1 yt-dlp -v "https://www.youtube.com/shorts/dQw4w9WgXcQ" 2>&1 | grep -i "bgutil\|pot"
 ```
 
-You should see a line like:
-```
-[youtube] [pot:bgutil:http] Generating a gvs PO Token for web_safari client via bgutil HTTP server
-```
+Do not capture verbose downloader output in ordinary logs or public support. Live source checks require separate authorization and private scope.
 
 **2. YouTube cookies (`YT_DLP_COOKIES_PATH`)**
 
@@ -339,13 +353,6 @@ The `docker-compose.yml` volume-mounts `/root/wpdbot/youtube-cookies.txt` to `/c
 docker compose up -d --force-recreate wpdbot
 ```
 
-Verify the cookie file is read:
-
-```sh
-docker exec wpdbot-wpdbot-1 yt-dlp -v "https://www.youtube.com/shorts/dQw4w9WgXcQ" 2>&1 | grep -i cookie
-# Should print: [youtube] Found YouTube account cookies
-```
-
 **Note:** Cookies expire. If downloads start failing again after previously working, re-export fresh cookies from your browser and replace the file on the server. Restart the container after replacing the file.
 
 ### Refresh `yt-dlp` And Chrome Dependencies
@@ -355,7 +362,6 @@ If YouTube Shorts fail with an `n challenge solving failed` warning or `Requeste
 ```sh
 docker compose build --no-cache
 docker compose up -d
-docker compose logs -f
 ```
 
 ### Recover From Chrome Profile Locks
@@ -365,30 +371,17 @@ The bot removes stale Chromium `SingletonLock`, `SingletonSocket`, and `Singleto
 ```sh
 docker compose down
 docker compose up -d
-docker compose logs -f
 ```
 
-### Reset A Corrupt WhatsApp Session
+### Authentication Failure
 
-Only do this when restart does not recover the session. This removes the saved WhatsApp login and browser cache, so you must scan the QR code again:
-
-```sh
-docker compose down
-docker volume ls
-docker volume rm <compose-project>_wpdbot-auth <compose-project>_wpdbot-cache
-docker compose up -d
-docker compose logs -f
-```
-
-Replace `<compose-project>` with the prefix shown by `docker volume ls`; it is often the clone directory name or `COMPOSE_PROJECT_NAME`.
-
-Keep the `wpdbot-data` volume unless you also want to erase group settings and repost history.
+Preserve database and LocalAuth data. Diagnose privately, then use the stopped-service one-shot login flow if authentication intervention is needed. Do not delete auth/database volumes to force recovery. Never restore a database alone or roll back a stale snapshot after later sends; paired quiesced backup/restore guidance belongs to Stage 4.
 
 ## Manual Smoke Test
 
 - Create a private WhatsApp test group.
 - Add the bot account and make it group admin.
-- Start the container and scan QR.
+- Only with explicit live-account authorization: stop the normal service, use private one-shot login, then start it.
 - Restart the container and confirm the session persists without a new QR scan.
 - Send `!bot status` and confirm bot admin shows `yes`.
 - Send `!bot enable` and confirm enabled response.

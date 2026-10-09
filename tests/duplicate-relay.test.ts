@@ -123,7 +123,7 @@ describe('group duplicate relaying', () => {
     expect(input.whatsapp.sendVideoOnce).toHaveBeenCalledOnce();
     expect(input.whatsapp.sendVideo).not.toHaveBeenCalled();
     expect(input.store.countReposts()).toBe(0);
-    expect(input.whatsapp.sendText).toHaveBeenLastCalledWith(message.groupId, 'A YouTube video has an unresolved send. No automatic retry. Original message kept.');
+    expect(input.whatsapp.sendText).toHaveBeenLastCalledWith(message.groupId, expect.stringContaining('Do not retry or repost'));
     expect(input.whatsapp.deleteMessage).not.toHaveBeenCalled();
   });
 
@@ -167,7 +167,7 @@ describe('group duplicate relaying', () => {
 
     expect(input.whatsapp.sendVideoOnce).toHaveBeenCalledOnce();
     expect(input.store.countReposts()).toBe(1);
-    expect(input.whatsapp.sendText).toHaveBeenCalledWith(message.groupId, 'A YouTube video has an unresolved send. No automatic retry. Original message kept.');
+    expect(input.whatsapp.sendText).toHaveBeenCalledWith(message.groupId, expect.stringContaining('Do not retry or repost'));
   });
 
   it.each(['inspection', 'download'] as const)('permits a later request after a definite pre-send %s failure', async (mode) => {

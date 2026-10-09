@@ -182,6 +182,62 @@ describe('createWhatsappBot', () => {
     expect(message.reply).toHaveBeenCalledWith('Bot enabled.');
   });
 
+  test('authorized inspection works while disabled and keeps foreign references out of the summary', async () => {
+    const store = fakeStore();
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: baseConfig(), store, downloader: fakeDownloader() });
+    const message = fakeMessage(' !BOT INSPECT ');
+    await deliver(message);
+    expect(message.reply).toHaveBeenCalledWith('Unfinished work in this group: 0 sources');
+    expect(store.setGroupEnabled).not.toHaveBeenCalled();
+  });
+
+  test.each(['foreign', 'missing', 'untracked'])('rejects %s quoted targets without falling back to a group summary', async (kind) => {
+    const store = fakeStore();
+    const list = vi.spyOn(store, 'listRelaySources');
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: baseConfig(), store, downloader: fakeDownloader() });
+    const quoted = kind === 'missing' ? null : { ...fakeMessage('private source'), from: kind === 'foreign' ? 'other-group@g.us' : 'group-1@g.us' };
+    const message = Object.assign(fakeMessage('!bot inspect'), { hasQuotedMsg: true, getQuotedMessage: vi.fn(async () => quoted) });
+    await deliver(message);
+    expect(message.reply).toHaveBeenCalledWith('Quoted source unavailable or untracked in this group. No work details shown.');
+    expect(list).toHaveBeenCalledTimes(1); // Ready recovery only, not inspection fallback.
+  });
+
+  test('unauthorized inspection never resolves a quote or reads work', async () => {
+    const store = fakeStore();
+    const list = vi.spyOn(store, 'listRelaySources');
+    const get = vi.spyOn(store, 'getRelaySource');
+    const logger = vi.fn();
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: baseConfig(), store, downloader: fakeDownloader(), logger });
+    const message = Object.assign(fakeMessage('!bot inspect', { author: 'member@c.us', contact: { number: 'member' } }),
+      { hasQuotedMsg: true, getQuotedMessage: vi.fn() });
+    await deliver(message);
+    expect(message.getQuotedMessage).not.toHaveBeenCalled();
+    expect(list).toHaveBeenCalledTimes(1); // Ready recovery only.
+    expect(get).not.toHaveBeenCalled();
+    expect(message.reply).toHaveBeenCalledWith(expect.stringContaining('no work details were shown'));
+    expect(logger).toHaveBeenCalledWith(expect.objectContaining({ cause: 'permission_rejected' }));
+    expect(JSON.stringify(logger.mock.calls)).not.toContain('member');
+  });
+
+  test('daemon never renders QR credentials or relays before authentication', async () => {
+    const logger = vi.fn();
+    const qr = await import('qrcode-terminal');
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader(), logger });
+    clients[0].emit('qr', 'PRIVATE-QR-CANARY');
+    clients[0].emit('qr', 'PRIVATE-QR-REFRESH');
+    clients[0].emit('auth_failure', 'PRIVATE-FAILURE');
+    expect(qr.default.generate).not.toHaveBeenCalled();
+    expect(JSON.stringify(logger.mock.calls)).not.toContain('PRIVATE');
+    expect(logger).toHaveBeenCalledOnce();
+    expect(logger).toHaveBeenCalledWith(expect.objectContaining({ cause: 'auth_required', stage: 'auth' }));
+    await clients[0].handlers.get('message')?.(fakeMessage('!bot enable'));
+    expect(clients[0].sendMessage).not.toHaveBeenCalled();
+  });
+
   test('refuses enable when bot is not admin', async () => {
     const store = fakeStore();
     const { createWhatsappBot } = await import('../src/whatsapp');

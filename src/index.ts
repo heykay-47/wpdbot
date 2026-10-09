@@ -1,13 +1,15 @@
 import 'dotenv/config';
-import { pathToFileURL } from 'node:url';
 import { loadConfig } from './config.js';
 import { createDownloader } from './downloader.js';
 import { KeyedTaskQueue } from './keyedTaskQueue.js';
 import { createStore, type Store } from './store.js';
 import { createWhatsappBot, type WhatsappBot } from './whatsapp.js';
+import { acquireAuthLock } from './authLock.js';
+import { resolveWhatsappRuntimePaths } from './whatsappRuntime.js';
 
-export function main(): void {
+export function main(logger?: (entry: Record<string, unknown>) => void): void {
   const config = loadConfig();
+  const release = acquireAuthLock(resolveWhatsappRuntimePaths().authDir);
   const store = createStore(config.sqlitePath, {
     maxFileSizeMb: config.maxFileSizeMb,
     duplicateWindowHours: config.duplicateWindowHours,
@@ -25,9 +27,9 @@ export function main(): void {
     },
   });
   const queue = new KeyedTaskQueue(config.concurrentDownloads);
-  const bot = createWhatsappBot({ config, store, downloader, queue });
+  const bot = createWhatsappBot({ config, store, downloader, queue, logger });
 
-  installShutdownHandlers(bot, store);
+  installShutdownHandlers(bot, { close() { store.close(); release(); } });
   bot.start();
 }
 
@@ -47,8 +49,4 @@ export function installShutdownHandlers(bot: Pick<WhatsappBot, 'stop'>, store: P
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-}
-
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main();
 }

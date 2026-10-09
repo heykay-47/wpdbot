@@ -155,7 +155,7 @@ describe('Instagram collection relaying', () => {
 
     expect(input.whatsapp.sendVideoOnce).toHaveBeenCalledTimes(2);
     expect(input.store.countReposts()).toBe(1);
-    expect(input.whatsapp.sendText).toHaveBeenLastCalledWith(message.groupId, 'An Instagram video has an unresolved send. No automatic retry. Original message kept.');
+    expect(input.whatsapp.sendText).toHaveBeenLastCalledWith(message.groupId, expect.stringContaining('Do not retry or repost'));
     expect(input.whatsapp.deleteMessage).not.toHaveBeenCalled();
     expect(input.downloads.every((path) => !existsSync(dirname(path)))).toBe(true);
   });

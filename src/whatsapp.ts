@@ -1,7 +1,7 @@
-import qrcode from 'qrcode-terminal';
 import whatsappWeb from 'whatsapp-web.js';
 import { canManageGroup, parseCommand } from './commands.js';
-import { messageForError } from './errorReporter.js';
+import { messageForError, userError } from './errorReporter.js';
+import { formatGroupInspection, formatSourceInspection } from './inspection.js';
 import { KeyedTaskQueue } from './keyedTaskQueue.js';
 import { handleIncomingMessage, recoverRelaySources, observeRelayAcknowledgement, type IncomingMessage, type RelayDownloader } from './relay.js';
 import { RelayLifecycle } from './relayLifecycle.js';
@@ -40,6 +40,7 @@ type CreateWhatsappBotInput = {
   downloader: RelayDownloader;
   queue?: KeyedTaskQueue;
   runtimePaths?: WhatsappRuntimePathInput;
+  logger?: (entry: Record<string, unknown>) => void;
 };
 
 type WhatsappMessage = {
@@ -50,6 +51,8 @@ type WhatsappMessage = {
   links?: Array<{ link?: string; isSuspicious?: boolean }>;
   timestamp?: number;
   fromMe?: boolean;
+  hasQuotedMsg?: boolean;
+  getQuotedMessage?(): Promise<WhatsappMessage>;
   reply(text: string): Promise<unknown> | unknown;
   getChat(): Promise<WhatsappChat>;
   getContact?(): Promise<WhatsappContact>;
@@ -89,7 +92,8 @@ export function formatStatus({ enabled, maxFileSizeMb, duplicateWindowHours, bot
   ].join('\n');
 }
 
-export function createWhatsappBot({ config, store, downloader, queue, runtimePaths: runtimePathInput }: CreateWhatsappBotInput): WhatsappBot {
+export function createWhatsappBot({ config, store, downloader, queue, runtimePaths: runtimePathInput, logger }: CreateWhatsappBotInput): WhatsappBot {
+  const logSanitizedError = (_message: string, error: unknown, step: string) => { messageForError(error, { step, logger }); };
   const control = new RelayLifecycle();
   control.setUsable(false);
   const relayQueue = queue ?? new KeyedTaskQueue(config.concurrentDownloads);
@@ -199,7 +203,7 @@ export function createWhatsappBot({ config, store, downloader, queue, runtimePat
 
   const recoveryInput = { store, downloader, whatsapp: relayWhatsapp, queue: relayQueue, control,
     timezone: config.timezone, downloadDir: config.downloadDir, maxMediaSizeMb: config.maxMediaSizeMb,
-    logger: (entry: Record<string, unknown>) => console.error('Relay error', entry) };
+    logger };
   let recovery: Promise<void> | undefined;
   let recoveryRequested = false;
   const resume = (): Promise<void> => {
@@ -217,14 +221,21 @@ export function createWhatsappBot({ config, store, downloader, queue, runtimePat
     return recovery;
   };
 
-  client.on('qr', (qr) => qrcode.generate(qr, { small: true }));
+  let authRequired = false;
+  const requireAuth = () => {
+    control.setUsable(false);
+    if (authRequired) return;
+    authRequired = true;
+    logSanitizedError('Private login required', userError('Private login required', 'auth_required'), 'auth');
+  };
+  client.on('qr', requireAuth);
   client.on('ready', () => {
-    console.log('WhatsApp client ready');
+    authRequired = false;
     control.setUsable(true);
     return resume();
   });
   client.on('disconnected', () => control.setUsable(false));
-  client.on('auth_failure', () => control.setUsable(false));
+  client.on('auth_failure', requireAuth);
   client.on('message_ack', (message, ack) => {
     const id = messageId(message);
     if (!id || !message.fromMe || !message.to) return;
@@ -238,7 +249,7 @@ export function createWhatsappBot({ config, store, downloader, queue, runtimePat
   });
   client.on('message', (message) => {
     if (!control.canSubmit()) return;
-    return handleWhatsappMessage(message as WhatsappMessage, client, config, store, relayWhatsapp, downloader, relayQueue, control, resume).catch((error: unknown) => {
+    return handleWhatsappMessage(message as WhatsappMessage, client, config, store, relayWhatsapp, downloader, relayQueue, control, resume, logger).catch((error: unknown) => {
       control.failStorage();
       logSanitizedError('Failed to handle WhatsApp message', error, 'whatsapp-message');
     });
@@ -270,13 +281,6 @@ export function createWhatsappBot({ config, store, downloader, queue, runtimePat
   };
 }
 
-function logSanitizedError(message: string, error: unknown, step: string): void {
-  messageForError(error, {
-    step,
-    logger: (entry) => console.error(message, entry),
-  });
-}
-
 async function handleWhatsappMessage(
   message: WhatsappMessage,
   client: InstanceType<typeof Client>,
@@ -287,6 +291,7 @@ async function handleWhatsappMessage(
   queue?: KeyedTaskQueue,
   control?: RelayLifecycle,
   resume?: () => Promise<void>,
+  logger?: (entry: Record<string, unknown>) => void,
 ): Promise<void> {
   const chat = await message.getChat();
   if (control && !control.canSubmit()) return;
@@ -309,12 +314,32 @@ async function handleWhatsappMessage(
     const ownerId = store.getBotOwnerId() ?? config.ownerId;
     const canManage = canManageGroup({ senderId, ownerId, senderIsGroupAdmin }) || idsOverlap(senderIds, idCandidates(ownerId));
     if (!canManage) {
-      await message.reply('Only group admins or bot owner can manage bot.');
+      messageForError(userError('Command not run', 'permission_rejected'), { step: 'permission', logger });
+      await message.reply('Only current-group admins or the bot owner may run this command. Command not run; no work details were shown.');
+      return;
+    }
+
+    if (command.action === 'inspect') {
+      if (!message.hasQuotedMsg) {
+        await message.reply(formatGroupInspection(store, groupId));
+        return;
+      }
+      const quoted = await message.getQuotedMessage?.().catch(() => null);
+      const quotedId = messageId(quoted ?? undefined);
+      if (!quoted || quoted.fromMe || quoted.from !== groupId || !quotedId) {
+        await message.reply('Quoted source unavailable or untracked in this group. No work details shown.');
+        return;
+      }
+      let source;
+      try { source = store.getRelaySource(groupId, quotedId); }
+      catch { await message.reply('Saved source state unavailable or unsupported. Work held; no details shown.'); return; }
+      await message.reply(source ? formatSourceInspection(store, source) : 'Quoted source unavailable or untracked in this group. No work details shown.');
       return;
     }
 
     if (command.action === 'enable') {
       if (!botIsAdmin) {
+        messageForError(userError('Command not run', 'permission_rejected'), { step: 'permission', logger });
         await message.reply('Make bot a group admin before enabling.');
         return;
       }
@@ -353,7 +378,7 @@ async function handleWhatsappMessage(
     maxMediaSizeMb: config.maxMediaSizeMb,
     control,
     queue,
-    logger: (entry) => console.error('Relay error', entry),
+    logger,
   });
 }
 

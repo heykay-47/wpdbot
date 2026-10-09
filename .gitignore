@@ -8,3 +8,4 @@ dist/
 .wwebjs_cache/
 docs/
 .worktrees/
+.diagnostics/

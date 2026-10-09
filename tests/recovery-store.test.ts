@@ -34,7 +34,7 @@ it('durably accepts ordered work once without resetting acceptance time or compl
   const store = createStore(path);
   stores.push(store);
   store.acceptRelaySource({ ...source, acceptedAtMs: 99_000 });
-  expect(store.listRelaySources()).toEqual([{ ...source, links: [{ ...source.links[0], status: 'skipped' }] }]);
+  expect(store.listRelaySources()).toEqual([{ ...source, workReference: saved.workReference, links: [{ ...source.links[0], status: 'skipped' }] }]);
   expect(store.getRelaySource('other-group', source.messageId)).toBeNull();
   expect(store.countReposts()).toBe(0);
 });
