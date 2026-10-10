@@ -10,7 +10,7 @@ WhatsApp group media relay bot for personal use. It watches enabled WhatsApp gro
 - Retains source messages for both platforms until the remaining cleanup safeguards are implemented.
 - Suppresses equivalent-video reposts per group, with durable protection for unresolved sends.
 - Tracks ordered multi-link work durably and resumes eligible interrupted work after restart.
-- Supports authorized per-group enable/disable/status/inspect commands.
+- Supports authorized per-group enable/disable/status/inspect/settings commands and source-targeted safe retry.
 - Runs as a Docker Compose service with persisted auth, cache, database, and download volumes.
 
 ### Equivalent links and safe sends
@@ -31,12 +31,13 @@ SQLite initialization adds `media_relay_attempts` without rewriting existing set
 - SQLite also adds versioned `relay_sources` snapshots. Intake persists the source/group IDs, attribution, timestamps, supported URLs, a content fingerprint and ordered link outcomes before queueing. Resolved video identities and positions are stored before downloading. Surrounding prose, credentials and raw extraction responses are not stored in this new table. The database still contains private URLs and attribution and must remain private.
 - Startup waits for the WhatsApp client to be ready and recovers only previously accepted work. It does not scan group history for messages posted while offline. Pre-send work can download and prepare again; leftover temporary files are not trusted as resumable downloads.
 - Before recovered sends, require the source to exist unchanged in its originating group. Missing, changed or unavailable sources stay held. Re-inspection must match saved collection identities/order; a changed plan stays held rather than substituting videos. Work older than 24 hours from acceptance, or with a future acceptance timestamp after clock rollback, requires authorized review. Age never expires confirmation records or unknown-delivery protection.
-- Same-source confirmed and duplicate-skipped outcomes remain completed. Recorded inspection/download/preparation failures are not automatically retried on restart or repeated source events. A new source message can request a video again after a definite pre-send failure, subject to current duplicate and unresolved-send guards. No retry/review command exists yet.
+- Same-source confirmed and duplicate-skipped outcomes remain completed. Recorded inspection/download/preparation failures are not automatically retried on restart or repeated source events. A new source message can request a video again after a definite pre-send failure, subject to current duplicate and unresolved-send guards. Authorized admins and the configured owner can explicitly retry only definitely pre-send failures through the two-step flow below; confirmed, skipped, and delivery-unknown items remain protected.
 - Send intent is committed before submission. A crash between that write and submission is conservatively held even if no send actually happened. Known repost IDs are stored immediately, including pending ACKs. Exact-ID lookup and later ACK events can establish positive confirmation in the originating group. Absent history, a failed lookup or no stored ID never establishes non-delivery and never authorizes another send. Legacy holds remain guards; no old queue or missing evidence is reconstructed.
 - Disabling a group pauses unsubmitted work without clearing outcomes. An already-started send may still record its evidence. Re-enabling makes paused work eligible under current settings and the source/age checks; it does not reset failures, confirmations or holds. A storage failure stops new submissions until the process is restarted and storage is repaired.
+- An admitted targeted retry grants one pass only. Restart, group disable, changed settings, or lost/unverifiable requester authority revokes any unused part of that grant. Preserve send evidence already in flight; remaining definitely pre-send work needs a fresh two-step preview and is never silently resumed as ordinary recovery.
 - `SIGINT` and `SIGTERM` stop intake and new submissions immediately. Active submissions have up to 30 seconds to record evidence, then the client is destroyed and SQLite closed without logout or auth deletion. Compose allows 35 seconds before forced termination. Abrupt loss still relies on durable send-intent guards; shutdown does not provide exactly-once delivery.
 
-A zero-hour stored group window disables prior-message confirmed suppression, not unresolved-send protection or same-source completion. Existing `.env` validation still requires a positive `DUPLICATE_WINDOW_HOURS`; new group-setting commands and ranges are not part of this change. Back up the database before updating a deployment, and do not run old and new relay versions against the same database concurrently.
+A zero-hour stored group window disables prior-message confirmed suppression, not unresolved-send protection or same-source completion. Existing `.env` validation still requires a positive `DUPLICATE_WINDOW_HOURS`; the group setting command can set the current group's window to zero. Group settings never rewrite historical values during migration. Back up the database before updating a deployment, and do not run old and new relay versions against the same database concurrently.
 
 ### Instagram collections
 
@@ -44,7 +45,7 @@ A zero-hour stored group window disables prior-message confirmed suppression, no
 - A source link with `img_index=3` requests only the third media item, counting photos as positions too. An invalid, unavailable, or non-video selection does not fall back to another video.
 - A failed item download or media preparation does not prevent other verifiable videos from being processed. Each video must meet the effective media budget; configured duration limits also apply to the probed final file.
 - Instagram source messages are always retained, including fully reposted single-video posts. Safe automatic cleanup awaits the remaining restart-recovery and deletion-guard work.
-- Unresolved sends stop that collection, not unrelated later links. Exact stored repost IDs may be reconciled, but there is no authorized recovery command yet. Do not erase progress records to force a retry; review the group first because the video may already be present.
+- Unresolved sends stop that collection, not unrelated later links. Exact stored repost IDs may be reconciled. A targeted retry never includes an unresolved send; other definitely pre-send failures may be reviewed when their source and saved plan still match. Do not erase progress records to force a retry; review the group first because the video may already be present.
 
 Metadata handling is conservative when yt-dlp omits entries or cannot establish their positions. Its deployed version is not pinned by this project, so fixture-based checks do not replace a separately authorized private-group smoke test.
 
@@ -161,10 +162,16 @@ Commands are sent in WhatsApp group chat.
 | `!bot status` | Shows enabled state, max size, duplicate window, supported platforms, and bot admin status. |
 | `!bot inspect` | Bounded unfinished-work summary for this group (up to ten sources), also while disabled. |
 | Reply to a source with `!bot inspect` | Saved link/item outcomes for that exact tracked source (up to twenty positions). Missing, foreign or untracked quotes show no work details. |
+| `!bot set max-size <MiB>` | Sets the current group's whole-number media limit from 1 MiB through the configured global ceiling. |
+| `!bot set duplicate-window <hours>` | Sets the current group's whole-number duplicate window from 0 through 720 hours. Zero disables only prior-message confirmed suppression. |
+| Reply to a source with `!bot retry` | Previews eligible definitely pre-send work and its saved link/item positions. It queues no work. |
+| Reply to the same source with `!bot retry confirm` | Requests one retry pass for that preview, within five minutes. Current settings, authority, source, saved plan, duplicate, media, and storage checks still apply. |
 
 Only group admins or the configured bot owner can manage the bot.
 
-Every durably accepted source has a persistent random `W-…` reference. Equivalent links in different sources have different references; references grant no access. A settled source may still have failed items. Inspection uses saved outcomes and exact stored attempt evidence, not guessed historical causes/counts/times. Unsupported saved records remain untouched and held, without blocking unrelated supported recovery. No targeted retry, settings change or cleanup command is implemented in Stage 1.
+Settings and retry commands are available while a group is disabled; retry itself is rejected until enabled. A retry preview is bound to the requesting admin, group, exact source, settings revision and eligible work; repeated requests do not extend its five-minute lifetime. Source age is the only retry bypass. Restart, disable, changed settings, or lost authority revokes unused retry permission. A confirmation for a delivery-unknown item never opens a retry path.
+
+Every durably accepted source has a persistent random `W-…` reference. Equivalent links in different sources have different references; references grant no access. A settled source may still have failed items. Inspection uses saved outcomes and exact stored attempt evidence, not guessed historical causes/counts/times. Unsupported saved records remain untouched and held, without blocking unrelated supported recovery. Automatic source cleanup remains unimplemented.
 
 ### Private diagnostics and login
 

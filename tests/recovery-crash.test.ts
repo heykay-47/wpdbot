@@ -90,3 +90,46 @@ it.each(['SIGINT', 'SIGTERM'] as const)('handles %s gracefully during pre-send w
   expect(store.countReposts()).toBe(0);
   expect(store.getRelaySource('group@g.us', 'source-1')?.links[0].plan?.items[0].status).toBe('ready');
 });
+
+it.each(['retry-admitted', 'retry-intent', 'retry-evidence', 'retry-confirmed'] as const)('revokes unused explicit permission after SIGKILL at %s and preserves evidence across two reopens', async (stage) => {
+  const root = mkdtempSync(join(tmpdir(), 'wpdbot-retry-crash-'));
+  roots.push(root);
+  const path = join(root, 'bot.sqlite');
+  const child = fork(new URL('./fixtures/recovery-worker.ts', import.meta.url), [path, root, stage], {
+    execArgv: ['--import', 'tsx'], stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  let stderr = '';
+  child.stderr?.on('data', (chunk) => { stderr += String(chunk); });
+  const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`Retry worker did not reach checkpoint: ${stderr}`)), 10_000);
+      child.once('message', () => { clearTimeout(timer); resolve(); });
+      child.once('error', (error) => { clearTimeout(timer); reject(error); });
+      child.once('exit', () => { clearTimeout(timer); reject(new Error(`Retry worker exited before checkpoint: ${stderr}`)); });
+    });
+  } finally {
+    child.kill('SIGKILL');
+    await exited;
+  }
+  let reference: string | undefined;
+  for (let reopen = 0; reopen < 2; reopen++) {
+    const store = createStore(path);
+    try {
+      const saved = store.getRelaySource('group@g.us', 'source-1')!;
+      reference ??= saved.workReference;
+      expect(saved.workReference).toBe(reference);
+      expect(store.hasActiveRetryPass('group@g.us', 'source-1')).toBe(false);
+      expect(saved.links.map((link) => link.plan?.items[0].status))
+        .toEqual([stage === 'retry-admitted' ? 'failed' : stage === 'retry-confirmed' ? 'confirmed' : 'held', 'failed']);
+      expect(store.countReposts()).toBe(stage === 'retry-confirmed' ? 1 : 0);
+      const sendVideoOnce = vi.fn();
+      await recoverRelaySources({ store, timezone: 'UTC', nowMs: 3_000,
+        downloader: { download: vi.fn(), resolveYouTube: vi.fn(), resolveInstagram: vi.fn() },
+        whatsapp: { sendVideo: vi.fn(), sendVideoOnce, sendText: vi.fn(), deleteMessage: vi.fn(),
+          lookupRepost: vi.fn(async () => null), getSourceMessage: vi.fn(async () => null) } });
+      expect(sendVideoOnce).not.toHaveBeenCalled();
+      expect(store.getRelaySource('group@g.us', 'source-1')).toEqual(saved);
+    } finally { store.close(); }
+  }
+});

@@ -115,6 +115,30 @@ it('holds work that ages beyond 24 hours while waiting in the queue', async () =
   expect(input.store.getRelaySource(message.groupId, message.id)).toMatchObject({ status: 'held', holdReason: 'stale' });
 });
 
+it.each([24 * 60 * 60 * 1000, 24 * 60 * 60 * 1000 + 1, -1])('enforces the exact ordinary recovery age boundary at %s ms', async (age) => {
+  const input = fixture();
+  await handleIncomingMessage({ ...input, queue: { run: async () => undefined } });
+  await recoverRelaySources({ ...input, nowMs: 2_000 + age });
+  expect(input.whatsapp.sendVideoOnce).toHaveBeenCalledTimes(age === 24 * 60 * 60 * 1000 ? 1 : 0);
+  if (age !== 24 * 60 * 60 * 1000) expect(input.store.getRelaySource(message.groupId, message.id))
+    .toMatchObject({ status: 'held', holdReason: 'stale' });
+});
+
+it('holds invalid acceptance timestamps without blocking unrelated supported work', async () => {
+  const input = fixture();
+  await handleIncomingMessage({ ...input, queue: { run: async () => undefined } });
+  const raw = new (await import('better-sqlite3')).default(input.path);
+  try {
+    const source = input.store.getRelaySource(message.groupId, message.id)!;
+    raw.prepare('UPDATE relay_sources SET state_json = ?').run(JSON.stringify({ ...source, acceptedAtMs: 'invalid' }));
+    await recoverRelaySources(input);
+    expect(input.whatsapp.sendVideoOnce).not.toHaveBeenCalled();
+    expect(() => input.store.getRelaySource(message.groupId, message.id)).toThrow();
+    await handleIncomingMessage({ ...input, message: { ...message, id: 'unrelated-source' } });
+    expect(input.whatsapp.sendVideoOnce).toHaveBeenCalledOnce();
+  } finally { raw.close(); }
+});
+
 it.each(['missing', 'changed', 'wrong-group', 'wrong-sender', 'lookup-error'] as const)('holds %s sources without sending from an unchecked snapshot', async (mode) => {
   const input = fixture();
   await handleIncomingMessage({ ...input, queue: { run: async () => undefined } });

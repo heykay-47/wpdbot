@@ -1,17 +1,37 @@
 import { describe, expect, it } from 'vitest';
-import { canEnableGroup, canManageGroup, parseCommand } from '../src/commands';
+import { canEnableGroup, canManageGroup, parseCommand, validateGroupSettingCommand } from '../src/commands';
 
 describe('parseCommand', () => {
   it.each([
     ['!bot enable', 'enable'],
     ['!bot disable', 'disable'],
     ['!bot status', 'status'],
+    ['!bot inspect', 'inspect'],
   ] as const)('parses %s', (body, action) => {
     expect(parseCommand(body)).toEqual({ action });
   });
 
   it('ignores non-command text', () => {
     expect(parseCommand('hello !bot enable')).toBeNull();
+  });
+});
+
+describe('group setting commands', () => {
+  it.each([
+    ['!bot set max-size 1', { setting: 'maxFileSizeMb', value: 1 }],
+    [' !BOT SET MAX-SIZE 64 ', { setting: 'maxFileSizeMb', value: 64 }],
+    ['!bot set duplicate-window 0', { setting: 'duplicateWindowHours', value: 0 }],
+    ['!bot set duplicate-window 720', { setting: 'duplicateWindowHours', value: 720 }],
+  ] as const)('accepts valid command %s', (body, expected) => {
+    expect(validateGroupSettingCommand(parseCommand(body), 64)).toEqual(expected);
+  });
+
+  it.each([
+    '!bot set max-size', '!bot set max-size 0', '!bot set max-size 65', '!bot set max-size 1.5',
+    '!bot set max-size 1 2', '!bot set duplicate-window -1', '!bot set duplicate-window 721',
+    '!bot set other 10',
+  ])('rejects malformed or out-of-range command %s without a setting mutation', (body) => {
+    expect(validateGroupSettingCommand(parseCommand(body), 64)).toBeNull();
   });
 });
 

@@ -36,6 +36,11 @@ export type RelaySource = {
 
 export class UnsupportedRelayStateError extends Error {}
 
+export function serializeRelaySource(source: RelaySource): string {
+  const { workReference: _workReference, ...persisted } = source;
+  return JSON.stringify(persisted);
+}
+
 export function validateRelaySource(source: RelaySource): void {
   try { validateSource(source); }
   catch { throw new UnsupportedRelayStateError('Durable source state is invalid or unsupported'); }

@@ -37,7 +37,11 @@ export function formatSourceInspection(store: InspectionStore, source: RelaySour
       lines.push(`Link ${linkIndex + 1}, item ${item.index} — ${outcomeText[itemOutcome(store, source, linkIndex, itemIndex)]}`);
     }
   }
-  if (source.status === 'held') lines.push('Source held; saved validation/age evidence prevents automatic recovery.');
+  if (source.status === 'held') {
+    lines.push(source.holdReason === 'retry-unresolved-send' || source.holdReason === 'retry-interrupted-with-unknown-send'
+      ? 'Source held because a send may have occurred; delivery-unknown items must not be retried. Only exact positive evidence can resolve this hold.'
+      : 'Source held; saved validation/age evidence prevents automatic recovery.');
+  }
   return lines.join('\n');
 }
 

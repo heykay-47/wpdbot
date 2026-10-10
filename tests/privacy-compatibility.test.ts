@@ -76,6 +76,22 @@ it('inspection gives pending intent priority over stale failed/ready snapshots, 
   } finally { store.close(); }
 });
 
+it('explains retry-related unknown holds without presenting them as stale-age holds', () => {
+  const store = createStore(':memory:');
+  try {
+    const held: RelaySource = { ...source, messageId: 'retry-unknown-source', status: 'held', holdReason: 'retry-unresolved-send' };
+    store.acceptRelaySource(held);
+    const key = { groupId: held.groupId, messageId: held.messageId, identity: held.links[0].plan!.items[0].identity! };
+    store.beginMediaRepost(key, { groupId: held.groupId, senderId: held.senderId, url: held.links[0].url, urlHash: held.links[0].urlHash, createdAtMs: 300 }, 24);
+
+    const text = formatSourceInspection(store, store.getRelaySource(held.groupId, held.messageId)!);
+
+    expect(text).toContain('delivery unknown; may already have been delivered — do not retry or repost');
+    expect(text).toContain('Only exact positive evidence can resolve this hold.');
+    expect(text).not.toContain('saved validation/age evidence');
+  } finally { store.close(); }
+});
+
 it('group inspection agrees with source inspection after positive evidence supersedes a failed snapshot', () => {
   const store = createStore(':memory:');
   try {

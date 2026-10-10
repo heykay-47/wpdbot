@@ -7,8 +7,8 @@ import { downloadCause, errorFacts, messageForError, userError, UserFacingError,
 import { formatSourceInspection, sourceUnfinished } from './inspection.js';
 import type { KeyedTaskQueue } from './keyedTaskQueue.js';
 import { extractSupportedUrls, normalizeUrlForDuplicate } from './extractors.js';
-import { candidateMediaIdentity, type MediaIdentity } from './mediaIdentity.js';
-import type { MediaRepostKey, RepostConfirmation, RepostEvidence, Store } from './store.js';
+import { candidateMediaIdentity, mediaIdentityKey, type MediaIdentity } from './mediaIdentity.js';
+import type { MediaRepostKey, RepostConfirmation, RepostEvidence, RetryPassTarget, Store } from './store.js';
 import { UnsupportedRelayStateError, type RelayItem, type RelayLink, type RelayPlan, type RelaySource } from './relayState.js';
 import type { RelayLifecycle } from './relayLifecycle.js';
 
@@ -39,7 +39,8 @@ export type RelayDownloader = {
 export type HandleIncomingMessageInput = {
   message: IncomingMessage;
   store: Pick<Store, 'getGroupSettings' | 'wasRecentlyPosted' | 'getMediaDisposition' | 'beginMediaRepost' | 'confirmMediaRepost'
-    | 'acceptRelaySource' | 'getRelaySource' | 'saveRelaySource' | 'listRelaySources' | 'getMediaAttempt' | 'recordMediaEvidence'>;
+    | 'acceptRelaySource' | 'getRelaySource' | 'saveRelaySource' | 'listRelaySources' | 'getMediaAttempt' | 'recordMediaEvidence'
+    | 'isRetryPassActive' | 'hasActiveRetryPass' | 'revokeRetryPass' | 'completeRetryPass'>;
   whatsapp: RelayWhatsapp;
   downloader: RelayDownloader;
   timezone: string;
@@ -51,6 +52,14 @@ export type HandleIncomingMessageInput = {
   queue?: Pick<KeyedTaskQueue, 'run'>;
   logger?: (entry: Record<string, unknown>) => void;
   control?: RelayLifecycle;
+  retry?: RetryExecution;
+};
+
+export type RetryExecution = {
+  passId: string;
+  settingsRevision: number;
+  requesterStillAuthorized(): Promise<boolean>;
+  sourceAndPlanStillMatch(source: RelaySource, link: RelayLink): Promise<boolean>;
 };
 
 type ActiveInput = HandleIncomingMessageInput & { source: RelaySource; link: RelayLink };
@@ -61,8 +70,12 @@ export type RecoveryInput = Omit<HandleIncomingMessageInput, 'message'> & {
   };
 };
 
-function hashUrl(value: string): string {
+export function relayContentHash(value: string): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+function hashUrl(value: string): string {
+  return relayContentHash(value);
 }
 
 function isDirectDownloadSubdir(parentDir: string, downloadDir: string): boolean {
@@ -115,7 +128,7 @@ async function handleIncomingMessageCore(input: HandleIncomingMessageInput, erro
   store.acceptRelaySource({
     version: 1, groupId: message.groupId, messageId: message.id, senderId: message.senderId,
     senderName: message.senderName, timestampMs: message.timestampMs, acceptedAtMs: processingNow(input),
-    contentHash: hashUrl(message.body), status: 'ready', cleanup: 'retained',
+    contentHash: relayContentHash(message.body), status: 'ready', cleanup: 'retained',
     links: links.map((link) => ({ url: link.url, platform: link.platform, urlHash: hashUrl(normalizeUrlForDuplicate(link.url)), status: 'ready', plan: null })),
   });
 
@@ -123,8 +136,9 @@ async function handleIncomingMessageCore(input: HandleIncomingMessageInput, erro
     if (input.control && !input.control.canPersist()) return;
     const source = store.getRelaySource(message.groupId, message.id)!;
     errorContext.reference = source.workReference;
+    if (store.hasActiveRetryPass(message.groupId, message.id)) return;
     if (source.status === 'settled' || source.status === 'held') return;
-    if (source.contentHash !== hashUrl(message.body) || source.senderId !== message.senderId) {
+    if (source.contentHash !== relayContentHash(message.body) || source.senderId !== message.senderId) {
       holdSource(input, source, 'source-changed');
       return;
     }
@@ -186,12 +200,17 @@ export async function recoverRelaySources(input: RecoveryInput): Promise<void> {
     const run = async () => {
       if (input.control && !input.control.canPersist()) return;
       const source = input.store.getRelaySource(entry.groupId, entry.messageId)!;
+      let sourceChanged = false;
       for (const link of source.links) {
         for (const item of link.plan?.items ?? []) {
-          if (!item.identity || item.status === 'skipped' || item.status === 'failed') continue;
+          if (!item.identity || item.status === 'skipped') continue;
           const key = { groupId: source.groupId, messageId: source.messageId, identity: item.identity };
           const attempt = input.store.getMediaAttempt(key);
-          if (attempt?.status === 'confirmed') { item.status = 'confirmed'; continue; }
+          if (attempt?.status === 'confirmed') {
+            if (item.status !== 'confirmed') { item.status = 'confirmed'; sourceChanged = true; }
+            continue;
+          }
+          if (item.status === 'failed') continue;
           if (attempt?.status !== 'sending' || !attempt.sentMessageId || attempt.sourceUrl !== link.url) continue;
           const evidence = await input.whatsapp.lookupRepost(source.groupId, attempt.sentMessageId).catch(() => null);
           if (input.control && !input.control.canPersist()) return;
@@ -200,15 +219,20 @@ export async function recoverRelaySources(input: RecoveryInput): Promise<void> {
             input.store.confirmMediaRepost(key, evidence, { groupId: source.groupId, senderId: source.senderId,
               url: link.url, urlHash: link.urlHash, createdAtMs: processingNow(input) });
           }
-          item.status = 'confirmed'; input.store.saveRelaySource(source);
+          item.status = 'confirmed'; sourceChanged = true;
         }
       }
+      if (sourceChanged) {
+        releaseResolvedRetryHold(input.store, source);
+        input.store.saveRelaySource(source);
+      }
       if (source.status === 'settled' || source.status === 'held') return;
+      if (input.store.hasActiveRetryPass(source.groupId, source.messageId)) return;
       if (!checkpoint(input, source)) return;
       const message = await input.whatsapp.getSourceMessage(source.groupId, source.messageId).catch(() => null);
       if (input.control && !input.control.canPersist()) return;
       if (!message || !message.isGroup || message.fromMe || message.groupId !== source.groupId || message.id !== source.messageId
-        || message.senderId !== source.senderId || hashUrl(message.body) !== source.contentHash) {
+         || message.senderId !== source.senderId || relayContentHash(message.body) !== source.contentHash) {
         holdSource(input, source, 'source-unavailable-or-changed');
         return;
       }
@@ -228,6 +252,52 @@ export async function recoverRelaySources(input: RecoveryInput): Promise<void> {
   }
 }
 
+export async function executeTargetedRetry(
+  input: HandleIncomingMessageInput & { retry: RetryExecution },
+  message: IncomingMessage,
+  targets: RetryPassTarget[],
+): Promise<void> {
+  const executionInput = { ...input, message };
+  const source = input.store.getRelaySource(message.groupId, message.id);
+  if (!source) { input.store.revokeRetryPass(input.retry.passId); return; }
+  const errorContext: ErrorReportContext = { step: 'recovery', reference: source.workReference, logger: input.logger };
+  try {
+    for (const { linkIndex } of targets) {
+      if (!checkpoint(executionInput, source)) return;
+      const link = source.links[linkIndex];
+      if (!link?.plan) { input.store.revokeRetryPass(input.retry.passId); return; }
+      link.status = 'ready';
+      const active = { ...executionInput, source, link };
+      errorContext.extractorId = link.platform;
+      errorContext.urlHash = link.urlHash;
+      errorContext.link = linkIndex + 1;
+      errorContext.item = undefined;
+      if (!checkpoint(executionInput, source)) return;
+      try {
+        if (link.platform === 'instagram') await relayInstagram(active, link.url, link.urlHash, errorContext);
+        else await relayYouTube(active, link.url, link.urlHash, errorContext);
+      } catch (error) {
+        if (!(error instanceof UserFacingError)) throw error;
+        await reportError(input, error, errorContext);
+      }
+      if (source.status === 'held' || source.status === 'paused') break;
+    }
+    if (!input.store.isRetryPassActive(input.retry.passId)) return;
+    const unknown = sealRetryTargets(input.store, source, targets);
+    if (unknown) {
+      source.status = 'held';
+      source.holdReason = 'retry-unresolved-send';
+    } else if (source.status === 'ready' && !source.links.some((link) => link.status === 'ready'
+      && (!link.plan || link.plan.items.some((item) => item.status === 'ready' || item.status === 'held')))) source.status = 'settled';
+    if (!executionInput.control || executionInput.control.canPersist()) executionInput.store.saveRelaySource(source);
+    executionInput.store.completeRetryPass(executionInput.retry.passId);
+  } catch (error) {
+    executionInput.store.revokeRetryPass(executionInput.retry.passId);
+    if (!(error instanceof UserFacingError) && !(error instanceof UnsupportedRelayStateError)) executionInput.control?.failStorage();
+    if (!executionInput.control || executionInput.control.canSubmit()) await reportError(executionInput, error, errorContext);
+  }
+}
+
 export function observeRelayAcknowledgement(input: Omit<HandleIncomingMessageInput, 'message'>, groupId: string, evidence: RepostConfirmation): void {
   if (!confirmedEvidence(evidence) || (input.control && !input.control.canPersist())) return;
   for (const source of input.store.listRelaySources()) {
@@ -240,6 +310,9 @@ export function observeRelayAcknowledgement(input: Omit<HandleIncomingMessageInp
         if (attempt?.status !== 'sending' || attempt.sentMessageId !== evidence.messageId || attempt.sourceUrl !== link.url) continue;
         input.store.confirmMediaRepost(key, evidence, { groupId, senderId: source.senderId,
           url: link.url, urlHash: link.urlHash, createdAtMs: processingNow(input) });
+        item.status = 'confirmed';
+        releaseResolvedRetryHold(input.store, source);
+        input.store.saveRelaySource(source);
       }
     }
   }
@@ -399,10 +472,13 @@ async function submitMedia(input: ActiveInput, submission: MediaSubmission, erro
       submission.item.status = 'failed'; store.saveRelaySource(input.source);
       throw userError('Video no longer meets the current media size limit. Original message kept.', 'size_limit');
     }
+    if (!await retryGuard(input, errorContext)) return;
     errorContext.step = 'record';
     const record = { groupId: message.groupId, senderId: message.senderId, url, urlHash, createdAtMs: processingNow(input) };
-    const reservation = store.beginMediaRepost(key, record, store.getGroupSettings(message.groupId).duplicateWindowHours);
+    const reservation = store.beginMediaRepost(key, record, store.getGroupSettings(message.groupId).duplicateWindowHours,
+      input.retry ? { retryPassId: input.retry.passId, settingsRevision: input.retry.settingsRevision } : undefined);
     if (reservation !== 'started') {
+      if (input.retry && !store.isRetryPassActive(input.retry.passId)) return;
       submission.item.status = reservation === 'completed' ? 'confirmed' : reservation === 'duplicate' ? 'skipped' : 'held';
       store.saveRelaySource(input.source);
       if (reservation === 'held') throw unresolvedSendError(key.identity.platform);
@@ -430,7 +506,7 @@ async function submitMedia(input: ActiveInput, submission: MediaSubmission, erro
       download.deliveryMode === 'document' ? 'document' : undefined, observe);
     const confirmation = await (input.control ? input.control.track(sending) : sending).catch((error: unknown) => {
       if (input.control && !input.control.canPersist()) return null;
-      submission.item.status = 'held'; store.saveRelaySource(input.source);
+      persistSubmittedItemStatus(input, submission.item, 'held');
       if (observationError) throw observationError;
       throw userError(unknownMessage, 'delivery_unknown');
     });
@@ -440,14 +516,44 @@ async function submitMedia(input: ActiveInput, submission: MediaSubmission, erro
       if (confirmation.messageId.trim() && Number.isInteger(confirmation.ack) && confirmation.ack >= -1 && confirmation.ack <= 4) {
         store.recordMediaEvidence(key, confirmation);
       }
-      submission.item.status = 'held'; store.saveRelaySource(input.source);
+      persistSubmittedItemStatus(input, submission.item, 'held');
       throw userError(unknownMessage, 'delivery_unknown');
     }
     if (store.getMediaAttempt(key)?.status !== 'confirmed') observe(confirmation);
-    submission.item.status = 'confirmed'; store.saveRelaySource(input.source);
+    persistSubmittedItemStatus(input, submission.item, 'confirmed');
   } finally {
     await cleanupDownload(download, downloadDir, cleanupPath);
   }
+}
+
+function persistSubmittedItemStatus(input: ActiveInput, item: RelayItem, status: RelayItem['status']): void {
+  const linkIndex = input.source.links.indexOf(input.link);
+  if (linkIndex < 0 || !item.identity) throw new Error('Submitted media no longer matches its source link');
+  const current = input.store.getRelaySource(input.source.groupId, input.source.messageId);
+  const link = current?.links[linkIndex];
+  const persistedItem = link?.plan?.items.find((candidate) => candidate.index === item.index);
+  if (!current || !link || !persistedItem?.identity || mediaIdentityKey(persistedItem.identity) !== mediaIdentityKey(item.identity)) {
+    throw new Error('Submitted media no longer matches its saved source plan');
+  }
+  const key = { groupId: input.source.groupId, messageId: input.source.messageId, identity: persistedItem.identity };
+  persistedItem.status = input.store.getMediaAttempt(key)?.status === 'confirmed' ? 'confirmed' : status;
+  if (persistedItem.status === 'confirmed') releaseResolvedRetryHold(input.store, current);
+  input.store.saveRelaySource(current);
+
+  Object.assign(input.link, link);
+  input.source.status = current.status;
+  if (current.holdReason) input.source.holdReason = current.holdReason;
+  else delete input.source.holdReason;
+  item.status = persistedItem.status;
+}
+
+function releaseResolvedRetryHold(store: HandleIncomingMessageInput['store'], source: RelaySource): void {
+  if (source.holdReason !== 'retry-unresolved-send' && source.holdReason !== 'retry-interrupted-with-unknown-send') return;
+  const unresolved = source.links.some((link) => link.plan?.items.some((item) => item.identity
+    && store.getMediaAttempt({ groupId: source.groupId, messageId: source.messageId, identity: item.identity })?.status === 'sending'));
+  if (unresolved) return;
+  source.status = 'settled';
+  delete source.holdReason;
 }
 
 function holdSource(input: Pick<HandleIncomingMessageInput, 'store' | 'logger'>, source: RelaySource, reason: 'source-changed' | 'media-changed' | 'source-unavailable-or-changed' | 'stale'): void {
@@ -458,18 +564,67 @@ function holdSource(input: Pick<HandleIncomingMessageInput, 'store' | 'logger'>,
     { step: 'recovery', reference: source.workReference, logger: input.logger });
 }
 
-function checkpoint(input: Pick<HandleIncomingMessageInput, 'control' | 'store' | 'now' | 'nowMs' | 'logger'>, source: RelaySource): boolean {
-  if (input.control && !input.control.canPersist()) return false;
+function checkpoint(input: Pick<HandleIncomingMessageInput, 'control' | 'store' | 'now' | 'nowMs' | 'logger' | 'retry'>, source: RelaySource): boolean {
+  if (input.control && !input.control.canPersist()) {
+    if (input.retry) input.store.revokeRetryPass(input.retry.passId);
+    return false;
+  }
+  if (input.retry && !input.store.isRetryPassActive(input.retry.passId)) return false;
   const age = processingNow(input) - source.acceptedAtMs;
-  if (age < 0 || age > 24 * 60 * 60 * 1000) {
+  if (age < 0 && input.retry) { input.store.revokeRetryPass(input.retry.passId); return false; }
+  if (age < 0 || (!input.retry && age > 24 * 60 * 60 * 1000)) {
     holdSource(input, source, 'stale');
     return false;
   }
   if ((input.control && !input.control.canSubmit()) || !input.store.getGroupSettings(source.groupId).enabled) {
+    if (input.retry) { input.store.revokeRetryPass(input.retry.passId); return false; }
     source.status = 'paused'; input.store.saveRelaySource(source);
     return false;
   }
   return true;
+}
+
+function sealRetryTargets(store: HandleIncomingMessageInput['store'], source: RelaySource, targets: RetryPassTarget[]): boolean {
+  let unknown = false;
+  for (const target of targets) {
+    const link = source.links[target.linkIndex];
+    if (!link?.plan) continue;
+    for (const itemIndex of target.itemIndexes) {
+      const item = link.plan.items.find((candidate) => candidate.index === itemIndex);
+      if (!item?.identity) continue;
+      const attempt = store.getMediaAttempt({ groupId: source.groupId, messageId: source.messageId, identity: item.identity });
+      if (attempt?.status === 'confirmed') item.status = 'confirmed';
+      else if (attempt?.status === 'sending') { item.status = 'held'; unknown = true; }
+      else if (item.status === 'ready') item.status = 'failed';
+    }
+  }
+  for (const link of source.links) {
+    for (const item of link.plan?.items ?? []) {
+      if (!item.identity) continue;
+      if (store.getMediaAttempt({ groupId: source.groupId, messageId: source.messageId, identity: item.identity })?.status === 'sending') unknown = true;
+    }
+  }
+  return unknown;
+}
+
+async function retryGuard(input: ActiveInput, context: ErrorReportContext): Promise<boolean> {
+  const retry = input.retry;
+  if (!retry) return true;
+  if (!input.store.isRetryPassActive(retry.passId)) return false;
+  const sourceMatches = await retry.sourceAndPlanStillMatch(input.source, input.link);
+  if (!sourceMatches) {
+    input.store.revokeRetryPass(retry.passId);
+    const current = input.store.getRelaySource(input.source.groupId, input.source.messageId);
+    if (current) holdSource(input, current, 'source-unavailable-or-changed');
+    return false;
+  }
+  const authorized = await retry.requesterStillAuthorized();
+  if (!authorized) {
+    input.store.revokeRetryPass(retry.passId);
+    messageForError(userError('Retry permission changed; remaining work held for a fresh request.', 'permission_rejected'), { ...context, step: 'permission', reference: input.source.workReference, logger: input.logger });
+    return false;
+  }
+  return checkpoint(input, input.source);
 }
 
 function confirmedEvidence(evidence: RepostEvidence): evidence is RepostConfirmation {

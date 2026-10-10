@@ -32,6 +32,15 @@ export class KeyedTaskQueue {
     }
   }
 
+  runIfIdle<T>(key: string, task: () => Promise<T>): Promise<T> | null {
+    if (this.tails.has(key)) return null;
+    return this.run(key, task);
+  }
+
+  has(key: string): boolean {
+    return this.tails.has(key);
+  }
+
   activeCount(): number {
     return this.tails.size;
   }

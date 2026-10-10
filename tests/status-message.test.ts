@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { createStore, type Store } from '../src/store';
-import { handleIncomingMessage } from '../src/relay';
+import { handleIncomingMessage, relayContentHash } from '../src/relay';
+import type { RelaySource } from '../src/relayState';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 const execaMock = vi.hoisted(() => vi.fn(async () => ({ stdout: '' })));
@@ -67,6 +68,14 @@ class MockClient extends EventEmitter {
     deletedMessages.push(message);
     return message;
   });
+  getChatById = vi.fn(async (id: string): Promise<any> => ({
+    isGroup: id.endsWith('@g.us'),
+    id: { _serialized: id },
+    participants: [
+      { id: { _serialized: 'admin@c.us' }, isAdmin: true, isSuperAdmin: false },
+      { id: { _serialized: 'bot@c.us' }, isAdmin: true, isSuperAdmin: false },
+    ],
+  }));
 
   constructor(options: unknown) {
     super();
@@ -260,6 +269,567 @@ describe('createWhatsappBot', () => {
     expect(message.reply).toHaveBeenCalledWith(
       'Bot status: disabled\nMax size: 64 MB\nDuplicate window: 24 hours\nSupported: Instagram reels/posts, YouTube Shorts\nBot admin: yes',
     );
+  });
+
+  test.each([
+    ['!BOT SET MAX-SIZE 32', { maxFileSizeMb: 32 }, 'Maximum media size set to 32 MiB.'],
+    ['!bot set duplicate-window 0', { duplicateWindowHours: 0 }, 'Duplicate window set to 0 hours.'],
+  ])('updates one validated group setting with %s', async (body, update, reply) => {
+    const store = fakeStore();
+    const set = vi.spyOn(store, 'setGroupSettings');
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: baseConfig(), store, downloader: fakeDownloader() });
+    const message = fakeMessage(body);
+
+    await deliver(message);
+
+    expect(set).toHaveBeenCalledWith('group-1@g.us', update);
+    expect(message.reply).toHaveBeenCalledWith(reply);
+  });
+
+  test('previews and admits one age-bypassing targeted retry for only the exact definitely pre-intent item', async () => {
+    const store = createStore(':memory:');
+    stores.push(store);
+    const groupId = 'group-1@g.us';
+    const sourceId = 'source-retry-1';
+    const body = 'https://youtube.com/shorts/AbCdEf123_-';
+    const acceptedAtMs = Date.now() - 25 * 60 * 60 * 1000;
+    const source: RelaySource = {
+      version: 1, groupId, messageId: sourceId, senderId: 'admin@c.us', senderName: 'Admin', timestampMs: acceptedAtMs,
+      acceptedAtMs, contentHash: relayContentHash(body), status: 'held', holdReason: 'stale', cleanup: 'retained',
+      links: [{ url: body, platform: 'youtube', urlHash: 'retry-hash', status: 'failed', plan: {
+        parentId: 'AbCdEf123_-', totalItems: 1,
+        items: [{ index: 1, kind: 'video', identity: { platform: 'youtube', videoId: 'AbCdEf123_-' }, status: 'failed' }],
+      } }],
+    };
+    store.setGroupEnabled(groupId, true);
+    store.acceptRelaySource(source);
+    const sourceMessage = fakeMessage(body, { id: sourceId, from: groupId, author: 'admin@c.us', timestamp: Math.floor(acceptedAtMs / 1000) });
+    const downloader = fakeDownloader();
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: baseConfig(), store, downloader });
+    clients[0].getMessageById.mockResolvedValue(sourceMessage);
+    clients[0].sendMessage.mockResolvedValue({ id: { _serialized: 'retry-repost-1' }, ack: 1, fromMe: true, to: groupId });
+    await clients[0].handlers.get('ready')?.();
+
+    const requestTimestamp = Math.floor(Date.now() / 1000);
+    const request = Object.assign(fakeMessage('!bot retry', { id: 'retry-request-1', timestamp: requestTimestamp }), {
+      hasQuotedMsg: true,
+      getQuotedMessage: vi.fn(async () => sourceMessage),
+    });
+    await clients[0].handlers.get('message')?.(request);
+    expect(request.reply).toHaveBeenCalledWith(expect.stringContaining('1 definitely pre-send item eligible: Link 1, item 1'));
+    expect(clients[0].sendMessage).not.toHaveBeenCalled();
+
+    const confirmation = Object.assign(fakeMessage('!bot retry confirm', { id: 'retry-confirm-1', timestamp: requestTimestamp + 1 }), {
+      hasQuotedMsg: true,
+      getQuotedMessage: vi.fn(async () => sourceMessage),
+    });
+    await clients[0].handlers.get('message')?.(confirmation);
+
+    expect(confirmation.reply).toHaveBeenCalledWith(expect.stringContaining('One targeted retry pass admitted'));
+    expect(clients[0].sendMessage).toHaveBeenCalledOnce();
+    expect(store.getMediaAttempt({ groupId, messageId: sourceId, identity: { platform: 'youtube', videoId: 'AbCdEf123_-' } }))
+      .toMatchObject({ status: 'confirmed', sentMessageId: 'retry-repost-1', ack: 1 });
+    expect(store.getRelaySource(groupId, sourceId)).toMatchObject({ status: 'settled', links: [{ plan: { items: [{ status: 'confirmed' }] } }] });
+
+    await clients[0].handlers.get('message')?.(confirmation);
+    expect(clients[0].sendMessage).toHaveBeenCalledOnce();
+  });
+
+  test('consumes a matching retry preview when the requester loses admin authority before confirmation', async () => {
+    const store = createStore(':memory:');
+    stores.push(store);
+    const groupId = 'group-1@g.us';
+    const sourceId = 'source-retry-lost-admin';
+    const body = 'https://youtube.com/shorts/AbCdEf123_-';
+    const acceptedAtMs = Date.now();
+    store.setGroupEnabled(groupId, true);
+    store.acceptRelaySource({ version: 1, groupId, messageId: sourceId, senderId: 'admin@c.us', senderName: 'Admin',
+      timestampMs: acceptedAtMs, acceptedAtMs, contentHash: relayContentHash(body), status: 'settled', cleanup: 'retained',
+      links: [{ url: body, platform: 'youtube', urlHash: 'retry-hash', status: 'failed', plan: { parentId: 'AbCdEf123_-', totalItems: 1,
+        items: [{ index: 1, kind: 'video', identity: { platform: 'youtube', videoId: 'AbCdEf123_-' }, status: 'failed' }] } }] });
+    const sourceMessage = fakeMessage(body, { id: sourceId, from: groupId, author: 'admin@c.us', timestamp: Math.floor(acceptedAtMs / 1000) });
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: baseConfig(), store, downloader: fakeDownloader() });
+    clients[0].getMessageById.mockResolvedValue(sourceMessage);
+    await clients[0].handlers.get('ready')?.();
+
+    const request = Object.assign(fakeMessage('!bot retry', { id: 'retry-lost-admin-request', timestamp: Math.floor(Date.now() / 1000) }), {
+      hasQuotedMsg: true, getQuotedMessage: vi.fn(async () => sourceMessage),
+    });
+    await clients[0].handlers.get('message')?.(request);
+    expect(request.reply).toHaveBeenCalledWith(expect.stringContaining('1 definitely pre-send item eligible: Link 1, item 1'));
+
+    clients[0].getChatById.mockResolvedValue({ isGroup: true, id: { _serialized: groupId }, participants: [
+      { id: { _serialized: 'member@c.us' }, isAdmin: false, isSuperAdmin: false },
+      { id: { _serialized: 'bot@c.us' }, isAdmin: true, isSuperAdmin: false },
+    ] });
+    const confirmation = Object.assign(fakeMessage('!bot retry confirm', { id: 'retry-lost-admin-confirm', timestamp: Math.floor(Date.now() / 1000) + 1,
+      participants: [{ id: { _serialized: 'member@c.us' }, isAdmin: false, isSuperAdmin: false },
+        { id: { _serialized: 'bot@c.us' }, isAdmin: true, isSuperAdmin: false }] }), {
+      author: 'admin@c.us', hasQuotedMsg: true, getQuotedMessage: vi.fn(async () => sourceMessage),
+    });
+    await clients[0].handlers.get('message')?.(confirmation);
+
+    expect(store.claimRetryConfirmation('retry-lost-admin-confirm')).toBe(false);
+    expect(confirmation.reply).toHaveBeenCalledWith(expect.stringContaining('current owner/admin authority could not be verified'));
+    expect(clients[0].sendMessage).not.toHaveBeenCalled();
+
+    clients[0].getChatById.mockResolvedValue({ isGroup: true, id: { _serialized: groupId }, participants: [
+      { id: { _serialized: 'admin@c.us' }, isAdmin: true, isSuperAdmin: false },
+      { id: { _serialized: 'bot@c.us' }, isAdmin: true, isSuperAdmin: false },
+    ] });
+    const replay = Object.assign(fakeMessage('!bot retry confirm', { id: 'retry-lost-admin-confirm-fresh', timestamp: Math.floor(Date.now() / 1000) + 2 }), {
+      hasQuotedMsg: true, getQuotedMessage: vi.fn(async () => sourceMessage),
+    });
+    await clients[0].handlers.get('message')?.(replay);
+    expect(replay.reply).toHaveBeenCalledWith(expect.stringContaining('No matching retry preview is pending'));
+    expect(clients[0].sendMessage).not.toHaveBeenCalled();
+  });
+
+  test('consumes and rejects a retry preview when the live source changes before admission', async () => {
+    const store = createStore(':memory:');
+    stores.push(store);
+    const groupId = 'group-1@g.us';
+    const sourceId = 'source-retry-edited';
+    const body = 'https://youtube.com/shorts/AbCdEf123_-';
+    const changedBody = `${body} edited`;
+    const acceptedAtMs = Date.now();
+    store.setGroupEnabled(groupId, true);
+    store.acceptRelaySource({ version: 1, groupId, messageId: sourceId, senderId: 'admin@c.us', senderName: 'Admin',
+      timestampMs: acceptedAtMs, acceptedAtMs, contentHash: relayContentHash(body), status: 'settled', cleanup: 'retained',
+      links: [{ url: body, platform: 'youtube', urlHash: 'retry-hash', status: 'failed', plan: { parentId: 'AbCdEf123_-', totalItems: 1,
+        items: [{ index: 1, kind: 'video', identity: { platform: 'youtube', videoId: 'AbCdEf123_-' }, status: 'failed' }] } }] });
+    const sourceMessage = fakeMessage(body, { id: sourceId, from: groupId, author: 'admin@c.us', timestamp: Math.floor(acceptedAtMs / 1000) });
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: baseConfig(), store, downloader: fakeDownloader() });
+    clients[0].getMessageById.mockResolvedValue(sourceMessage);
+    await clients[0].handlers.get('ready')?.();
+
+    const requestTimestamp = Math.floor(Date.now() / 1000);
+    const request = Object.assign(fakeMessage('!bot retry', { id: 'retry-edit-request', timestamp: requestTimestamp }), {
+      hasQuotedMsg: true, getQuotedMessage: vi.fn(async () => sourceMessage),
+    });
+    await clients[0].handlers.get('message')?.(request);
+    expect(request.reply).toHaveBeenCalledWith(expect.stringContaining('1 definitely pre-send item eligible: Link 1, item 1'));
+
+    clients[0].getMessageById.mockResolvedValue(fakeMessage(changedBody, { id: sourceId, from: groupId, author: 'admin@c.us', timestamp: requestTimestamp }));
+    const confirmation = Object.assign(fakeMessage('!bot retry confirm', { id: 'retry-edit-confirm', timestamp: requestTimestamp + 1 }), {
+      hasQuotedMsg: true, getQuotedMessage: vi.fn(async () => sourceMessage),
+    });
+    await clients[0].handlers.get('message')?.(confirmation);
+
+    expect(store.claimRetryConfirmation('retry-edit-confirm')).toBe(false);
+    expect(confirmation.reply).toHaveBeenCalledWith(expect.stringContaining('Source is missing, changed, or unavailable'));
+    expect(store.getRelaySource(groupId, sourceId)).toMatchObject({ status: 'held', holdReason: 'source-unavailable-or-changed' });
+    expect(clients[0].sendMessage).not.toHaveBeenCalled();
+  });
+
+  test('records an in-flight retry confirmation without reviving other work after group disable', async () => {
+    const store = createStore(':memory:');
+    stores.push(store);
+    const groupId = 'group-1@g.us';
+    const sourceId = 'source-retry-disabled-in-flight';
+    const firstUrl = 'https://youtube.com/shorts/First123456';
+    const secondUrl = 'https://youtube.com/shorts/Second12345';
+    const acceptedAtMs = Date.now();
+    store.setGroupEnabled(groupId, true);
+    store.acceptRelaySource({ version: 1, groupId, messageId: sourceId, senderId: 'admin@c.us', senderName: 'Admin',
+      timestampMs: acceptedAtMs, acceptedAtMs, contentHash: relayContentHash(`${firstUrl} ${secondUrl}`), status: 'settled', cleanup: 'retained',
+      links: [
+        { url: firstUrl, platform: 'youtube', urlHash: 'retry-first', status: 'failed', plan: { parentId: 'First123456', totalItems: 1,
+          items: [{ index: 1, kind: 'video', identity: { platform: 'youtube', videoId: 'First123456' }, status: 'failed' }] } },
+        { url: secondUrl, platform: 'youtube', urlHash: 'retry-second', status: 'failed', plan: { parentId: 'Second12345', totalItems: 1,
+          items: [{ index: 1, kind: 'video', identity: { platform: 'youtube', videoId: 'Second12345' }, status: 'failed' }] } },
+      ] });
+    const sourceMessage = fakeMessage(`${firstUrl} ${secondUrl}`, { id: sourceId, from: groupId, author: 'admin@c.us', timestamp: Math.floor(acceptedAtMs / 1000) });
+    const baseDownloader = fakeDownloader();
+    const downloader = { ...baseDownloader, resolveYouTube: vi.fn(async (url: string) => {
+      const id = url.includes('First') ? 'First123456' : 'Second12345';
+      return { id, download: (maxFileSizeMb: number) => baseDownloader.download(url, maxFileSizeMb) };
+    }) };
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: baseConfig(), store, downloader });
+    clients[0].getMessageById.mockResolvedValue(sourceMessage);
+    await clients[0].handlers.get('ready')?.();
+
+    const requestTimestamp = Math.floor(Date.now() / 1000);
+    const request = Object.assign(fakeMessage('!bot retry', { id: 'retry-disable-request', timestamp: requestTimestamp }), {
+      hasQuotedMsg: true, getQuotedMessage: vi.fn(async () => sourceMessage),
+    });
+    await clients[0].handlers.get('message')?.(request);
+    expect(request.reply).toHaveBeenCalledWith(expect.stringContaining('2 definitely pre-send items eligible: Link 1, item 1; Link 2, item 1'));
+
+    let finishSend!: (value: { id: { _serialized: string }; ack: number; fromMe: boolean; to: string }) => void;
+    clients[0].sendMessage.mockImplementationOnce(() => new Promise((resolve) => { finishSend = resolve; }));
+    const confirmation = Object.assign(fakeMessage('!bot retry confirm', { id: 'retry-disable-confirm', timestamp: requestTimestamp + 1 }), {
+      hasQuotedMsg: true, getQuotedMessage: vi.fn(async () => sourceMessage),
+    });
+    const running = clients[0].handlers.get('message')?.(confirmation) as Promise<void>;
+    await vi.waitFor(() => expect(clients[0].sendMessage).toHaveBeenCalledOnce());
+
+    store.setGroupEnabled(groupId, false);
+    expect(store.getRelaySource(groupId, sourceId)).toMatchObject({ status: 'held', holdReason: 'retry-interrupted-with-unknown-send',
+      links: [{ plan: { items: [{ status: 'held' }] } }, { plan: { items: [{ status: 'failed' }] } }] });
+    finishSend({ id: { _serialized: 'retry-disable-sent' }, ack: 1, fromMe: true, to: groupId });
+    await running;
+
+    const afterLateConfirmation = store.getRelaySource(groupId, sourceId)!;
+    expect(afterLateConfirmation).toMatchObject({ status: 'settled',
+      links: [{ plan: { items: [{ status: 'confirmed' }] } }, { plan: { items: [{ status: 'failed' }] } }] });
+    expect(afterLateConfirmation.holdReason).toBeUndefined();
+    expect(store.getMediaAttempt({ groupId, messageId: sourceId, identity: { platform: 'youtube', videoId: 'First123456' } }))
+      .toMatchObject({ status: 'confirmed', sentMessageId: 'retry-disable-sent', ack: 1 });
+    expect(store.getMediaAttempt({ groupId, messageId: sourceId, identity: { platform: 'youtube', videoId: 'Second12345' } })).toBeNull();
+  });
+
+  test.each(['!bot set max-size 0', '!bot set max-size 65', '!bot set max-size 1.5', '!bot set duplicate-window 721', '!bot set unknown 1'])('does not mutate settings for invalid command %s', async (body) => {
+    const store = fakeStore();
+    const set = vi.spyOn(store, 'setGroupSettings');
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: baseConfig(), store, downloader: fakeDownloader() });
+    const message = fakeMessage(body);
+
+    await deliver(message);
+
+    expect(set).not.toHaveBeenCalled();
+    expect(message.reply).toHaveBeenCalledWith(expect.stringContaining('No settings changed.'));
+  });
+
+  test('retries a real saved pre-intent failure rather than rejecting its unchanged snapshot', async () => {
+    const fixture = await retryCommandFixture();
+    fixture.store.saveRelaySource(fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)!);
+    await fixture.request();
+    const confirmation = fixture.command('!bot retry confirm', 'confirm', 1);
+    clients[0].sendMessage.mockResolvedValue({ id: { _serialized: 'retry-confirmed' }, ack: 1, fromMe: true, to: fixture.groupId });
+    await clients[0].handlers.get('message')?.(confirmation);
+    expect(confirmation.reply).toHaveBeenCalledWith(expect.stringContaining('One targeted retry pass admitted'));
+    expect(fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)?.links[0].plan?.items[0].status).toBe('confirmed');
+  });
+
+  test.each(['disable-enable', 'expiry', 'late-ack'] as const)('rejects %s occurring while confirmation validation is running', async (change) => {
+    const fixture = await retryCommandFixture();
+    await fixture.request();
+    const resolve = fixture.downloader.resolveYouTube.getMockImplementation()!;
+    let continueValidation!: () => void;
+    const blocked = new Promise<void>((resume) => { continueValidation = resume; });
+    fixture.downloader.resolveYouTube.mockImplementationOnce(async (url) => { await blocked; return resolve(url); });
+    const confirmation = fixture.command('!bot retry confirm', 'confirm', 1);
+    const confirming = clients[0].handlers.get('message')?.(confirmation);
+    await vi.waitFor(() => expect(fixture.downloader.resolveYouTube).toHaveBeenCalledTimes(2));
+    if (change === 'disable-enable') {
+      await clients[0].handlers.get('message')?.(fakeMessage('!bot disable'));
+      await clients[0].handlers.get('message')?.(fakeMessage('!bot enable'));
+    } else if (change === 'expiry') {
+      vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 300_000);
+    } else {
+      const source = fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)!;
+      const key = { groupId: fixture.groupId, messageId: fixture.sourceId, identity: source.links[0].plan!.items[0].identity! };
+      fixture.store.beginMediaRepost(key, { groupId: fixture.groupId, senderId: source.senderId,
+        url: source.links[0].url, urlHash: source.links[0].urlHash, createdAtMs: Date.now() }, 24);
+      fixture.store.recordMediaEvidence(key, { messageId: 'late-ack-repost', ack: 0 });
+      clients[0].emit('message_ack', { id: { _serialized: 'late-ack-repost' }, fromMe: true, to: fixture.groupId }, 1);
+    }
+    continueValidation();
+    await confirming;
+    expect(confirmation.reply).not.toHaveBeenCalledWith(expect.stringContaining('One targeted retry pass admitted'));
+    expect(clients[0].sendMessage).not.toHaveBeenCalled();
+    expect(fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)?.links[0].plan?.items[0].status)
+      .toBe(change === 'late-ack' ? 'confirmed' : 'failed');
+    vi.restoreAllMocks();
+  });
+
+  test('admission reply failure cannot abandon the pass or permit ordinary recovery', async () => {
+    const fixture = await retryCommandFixture();
+    await fixture.request();
+    const confirmation = fixture.command('!bot retry confirm', 'confirm', 1);
+    confirmation.reply.mockRejectedValueOnce(new Error('synthetic notification failure'));
+    clients[0].sendMessage.mockResolvedValue({ id: { _serialized: 'retry-confirmed' }, ack: 1, fromMe: true, to: fixture.groupId });
+    await clients[0].handlers.get('message')?.(confirmation);
+    expect(fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)?.links[0].plan?.items[0].status).toBe('confirmed');
+    expect(clients[0].sendMessage).toHaveBeenCalledOnce();
+  });
+
+  test('ordinary recovery cannot execute explicit work while its admission notification is pending', async () => {
+    const fixture = await retryCommandFixture();
+    await fixture.request();
+    const confirmation = fixture.command('!bot retry confirm', 'confirm', 1);
+    let finishReply!: () => void;
+    confirmation.reply.mockImplementationOnce(() => new Promise<void>((resolve) => { finishReply = resolve; }));
+    const confirming = clients[0].handlers.get('message')?.(confirmation);
+    await vi.waitFor(() => expect(confirmation.reply).toHaveBeenCalledOnce());
+    const { recoverRelaySources } = await import('../src/relay');
+    const send = vi.fn();
+    await recoverRelaySources({ store: fixture.store, downloader: fixture.downloader,
+      whatsapp: { ...fixture.bot.relayWhatsapp, sendVideoOnce: send }, timezone: 'UTC' });
+    expect(send).not.toHaveBeenCalled();
+    fixture.store.setGroupEnabled(fixture.groupId, false);
+    finishReply();
+    await confirming;
+    expect(clients[0].sendMessage).not.toHaveBeenCalled();
+    expect(fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)?.links[0].plan?.items[0].status).toBe('failed');
+  });
+
+  test('competing authorized previews admit one pass and reject rather than queue another', async () => {
+    const fixture = await retryCommandFixture();
+    await fixture.request();
+    const ownerRequest = fixture.command('!bot retry', 'owner-request', 0, 'owner@c.us');
+    await clients[0].handlers.get('message')?.(ownerRequest);
+    expect(ownerRequest.reply).toHaveBeenCalledWith(expect.stringContaining('1 definitely pre-send item eligible'));
+    const confirmations = [fixture.command('!bot retry confirm', 'confirm-admin', 1),
+      fixture.command('!bot retry confirm', 'confirm-owner', 1, 'owner@c.us')];
+    let finishReply!: () => void;
+    const reply = new Promise<void>((resolve) => { finishReply = resolve; });
+    for (const confirmation of confirmations) confirmation.reply.mockReturnValue(reply);
+    clients[0].sendMessage.mockResolvedValue({ id: { _serialized: 'retry-confirmed' }, ack: 1, fromMe: true, to: fixture.groupId });
+    const confirming = confirmations.map((confirmation) => clients[0].handlers.get('message')?.(confirmation));
+    await vi.waitFor(() => expect(confirmations.every((confirmation) => confirmation.reply.mock.calls.length > 0)).toBe(true));
+    const replies = confirmations.map((confirmation) => String(confirmation.reply.mock.calls[0][0]));
+    expect(replies.filter((text) => text.includes('One targeted retry pass admitted'))).toHaveLength(1);
+    expect(replies.filter((text) => text.includes('already has active work'))).toHaveLength(1);
+    finishReply();
+    await Promise.all(confirming);
+    expect(clients[0].sendMessage).toHaveBeenCalledOnce();
+    const repeated = fixture.command('!bot retry confirm', 'confirm-loser-again', 2, 'owner@c.us');
+    await clients[0].handlers.get('message')?.(repeated);
+    expect(repeated.reply).toHaveBeenCalledWith(expect.stringContaining('No matching retry preview'));
+  });
+
+  test('old confirmations cannot authorize a fresh preview after a definite pre-intent retry failure', async () => {
+    const fixture = await retryCommandFixture();
+    await fixture.request();
+    fixture.downloader.download.mockRejectedValueOnce(new Error('synthetic download failure'));
+    const old = fixture.command('!bot retry confirm', 'old-confirm', 1);
+    await clients[0].handlers.get('message')?.(old);
+    expect(fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)?.links[0].plan?.items[0].status).toBe('failed');
+    const freshRequest = fixture.command('!bot retry', 'new-request', 2);
+    await clients[0].handlers.get('message')?.(freshRequest);
+    expect(freshRequest.reply).toHaveBeenCalledWith(expect.stringContaining('1 definitely pre-send item eligible'));
+    await clients[0].handlers.get('message')?.(old);
+    expect(old.reply).toHaveBeenLastCalledWith(expect.stringContaining('already used'));
+    expect(mediaPaths).toHaveLength(0);
+    clients[0].sendMessage.mockResolvedValue({ id: { _serialized: 'retry-confirmed' }, ack: 1, fromMe: true, to: fixture.groupId });
+    await clients[0].handlers.get('message')?.(fixture.command('!bot retry confirm', 'new-confirm', 3));
+    expect(mediaPaths).toHaveLength(1);
+    expect(fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)?.links[0].plan?.items[0].status).toBe('confirmed');
+  });
+
+  test('lost authority after admission revokes unused permission without ordinary recovery revival', async () => {
+    const fixture = await retryCommandFixture();
+    await fixture.request();
+    const confirmation = fixture.command('!bot retry confirm', 'confirm', 1);
+    confirmation.reply.mockImplementationOnce(async () => {
+      clients[0].getChatById.mockResolvedValue({ isGroup: true, id: { _serialized: fixture.groupId }, participants: [] });
+    });
+    await clients[0].handlers.get('message')?.(confirmation);
+    expect(fixture.store.hasActiveRetryPass(fixture.groupId, fixture.sourceId)).toBe(false);
+    expect(fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)?.links[0].plan?.items[0].status).toBe('failed');
+    await clients[0].handlers.get('ready')?.();
+    expect(mediaPaths).toHaveLength(0);
+  });
+
+  test.each(['authority', 'source'] as const)('rechecks %s after the final expensive retry plan resolution', async (change) => {
+    const fixture = await retryCommandFixture();
+    await fixture.request();
+    const resolve = fixture.downloader.resolveYouTube.getMockImplementation()!;
+    let finishPlan!: () => void;
+    const blocked = new Promise<void>((resume) => { finishPlan = resume; });
+    fixture.downloader.resolveYouTube.mockImplementation(async (url) => {
+      if (fixture.downloader.resolveYouTube.mock.calls.length === 4) await blocked;
+      return resolve(url);
+    });
+    const confirmation = fixture.command('!bot retry confirm', 'confirm', 1);
+    const confirming = clients[0].handlers.get('message')?.(confirmation);
+    await vi.waitFor(() => expect(fixture.downloader.resolveYouTube).toHaveBeenCalledTimes(4));
+    if (change === 'authority') clients[0].getChatById.mockResolvedValue({ isGroup: true, id: { _serialized: fixture.groupId }, participants: [] });
+    else clients[0].getMessageById.mockResolvedValue(fakeMessage(`${fixture.sourceMessage.body} edited`, { id: fixture.sourceId }));
+    finishPlan();
+    await confirming;
+    expect(mediaPaths).toHaveLength(0);
+    expect(fixture.store.hasActiveRetryPass(fixture.groupId, fixture.sourceId)).toBe(false);
+    expect(fixture.store.getMediaAttempt({ groupId: fixture.groupId, messageId: fixture.sourceId,
+      identity: { platform: 'youtube', videoId: 'AbCdEf123_-' } })).toBeNull();
+  });
+
+  test.each(['video', 'document'] as const)('enforces actual final %s bytes at the exact group budget', async (mode) => {
+    for (const excess of [0, 1]) {
+      clients.length = 0;
+      mediaPaths.length = 0;
+      const fixture = await retryCommandFixture();
+      fixture.store.setGroupSettings(fixture.groupId, { maxFileSizeMb: 1 });
+      await fixture.request();
+      const download = fixture.downloader.download.getMockImplementation()!;
+      fixture.downloader.download.mockImplementationOnce(async (url, limit) => {
+        const file = await download(url, limit);
+        writeFileSync(file.filePath, Buffer.alloc(1024 * 1024 + excess));
+        return { ...file, sizeBytes: 1, deliveryMode: mode };
+      });
+      clients[0].sendMessage.mockResolvedValue({ id: { _serialized: 'retry-confirmed' }, ack: 1, fromMe: true, to: fixture.groupId });
+      await clients[0].handlers.get('message')?.(fixture.command('!bot retry confirm', 'confirm', 1));
+      expect(mediaPaths).toHaveLength(excess === 0 ? 1 : 0);
+      expect(fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)?.links[0].plan?.items[0].status)
+        .toBe(excess === 0 ? 'confirmed' : 'failed');
+      if (excess === 0 && mode === 'document') expect(clients[0].sendMessage).toHaveBeenCalledWith(fixture.groupId, expect.any(MockMessageMedia),
+        expect.objectContaining({ sendMediaAsDocument: true }));
+      await fixture.bot.stop();
+    }
+  });
+
+  test.each(['hold-write', 'request-read', 'request-preparation', 'confirm-read', 'confirm-preparation', 'post-admission-read', 'post-admission-authority'] as const)(
+    'stops new commands/submissions after a retry %s storage failure', async (fault) => {
+      const fixture = await retryCommandFixture();
+      const storageError = new Error('synthetic storage failure');
+      const confirmationFault = fault.startsWith('confirm') || fault.startsWith('post-admission');
+      if (confirmationFault) await fixture.request();
+      if (fault === 'hold-write') {
+        clients[0].getMessageById.mockResolvedValue(null);
+        vi.spyOn(fixture.store, 'saveRelaySource').mockImplementationOnce(() => { throw storageError; });
+      } else if (fault === 'request-read' || fault === 'confirm-read') {
+        vi.spyOn(fixture.store, 'getRelaySource').mockImplementationOnce(() => { throw storageError; });
+      } else if (fault === 'post-admission-read' || fault === 'post-admission-authority') {
+        // Introduce the failure after successful atomic admission, at the final pre-intent guards.
+      } else {
+        vi.spyOn(fixture.store, 'getMediaDisposition').mockImplementationOnce(() => { throw storageError; });
+      }
+      const failing = fixture.command(confirmationFault ? '!bot retry confirm' : '!bot retry', 'failing', 1);
+      if (fault.startsWith('post-admission')) {
+        failing.reply.mockImplementationOnce(async () => {
+          if (fault === 'post-admission-read') vi.spyOn(fixture.store, 'getRelaySource').mockImplementationOnce(() => { throw storageError; });
+          else vi.spyOn(fixture.store, 'getBotOwnerId').mockImplementationOnce(() => { throw storageError; });
+        });
+      }
+      await clients[0].handlers.get('message')?.(failing);
+      const later = fakeMessage('!bot set max-size 32');
+      await clients[0].handlers.get('message')?.(later);
+      expect(later.reply).not.toHaveBeenCalled();
+      expect(fixture.store.getGroupSettings(fixture.groupId).maxFileSizeMb).toBe(64);
+      expect(mediaPaths).toHaveLength(0);
+    });
+
+  test('winning admission invalidates a competing consumed preview even if the source returns to the same failed state', async () => {
+    const fixture = await retryCommandFixture();
+    const source = fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)!;
+    source.links[0].status = 'ready';
+    fixture.store.saveRelaySource(source);
+    await fixture.request();
+    await clients[0].handlers.get('message')?.(fixture.command('!bot retry', 'owner-request', 0, 'owner@c.us'));
+    const getChat = clients[0].getChatById.getMockImplementation()!;
+    let finishAuthority!: () => void;
+    const blocked = new Promise<void>((resolve) => { finishAuthority = resolve; });
+    clients[0].getChatById.mockImplementationOnce(async (id) => { await blocked; return getChat(id); });
+    const losing = fixture.command('!bot retry confirm', 'losing-confirm', 1);
+    const validating = clients[0].handlers.get('message')?.(losing);
+    await vi.waitFor(() => expect(clients[0].getChatById).toHaveBeenCalledOnce());
+    fixture.downloader.download.mockRejectedValueOnce(new Error('synthetic download failure'));
+    await clients[0].handlers.get('message')?.(fixture.command('!bot retry confirm', 'winning-confirm', 1, 'owner@c.us'));
+    expect(fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)).toEqual(source);
+    finishAuthority();
+    await validating;
+    expect(losing.reply).not.toHaveBeenCalledWith(expect.stringContaining('One targeted retry pass admitted'));
+    expect(mediaPaths).toHaveLength(0);
+  });
+
+  test('mixed-platform A/B/C retry selects only failed B and preserves A/C through two reopens', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wpdbot-mixed-retry-'));
+    tempDirs.push(root);
+    const path = join(root, 'state.sqlite');
+    const groupId = 'group-1@g.us';
+    const sourceId = 'mixed-source';
+    const body = 'https://youtube.com/shorts/First123456 https://instagram.com/p/Post123/ https://youtube.com/shorts/Third123456';
+    const timestamp = Math.floor(Date.now() / 1000);
+    const sourceMessage = fakeMessage(body, { id: sourceId, timestamp });
+    const firstStore = createStore(path);
+    firstStore.setGroupEnabled(groupId, true);
+    let failB = true;
+    const downloader = {
+      resolveYouTube: vi.fn(async (url: string) => ({ id: url.split('/').at(-1)!,
+        download: (limit: number) => fakeDownloader().download(url, limit) })),
+      resolveInstagram: vi.fn(async (url: string) => ({ id: 'post-1', totalItems: 1,
+        items: [{ id: 'video-1', index: 1, kind: 'video' as const, download: async (limit: number) => {
+          if (failB) throw new Error('synthetic B failure');
+          return fakeDownloader().download(url, limit);
+        } }] })),
+    };
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const firstBot = createWhatsappBot({ config: baseConfig(), store: firstStore, downloader });
+    let sent = 0;
+    clients[0].sendMessage.mockImplementation(async () => ({ id: { _serialized: `confirmed-${++sent}` }, ack: 1, fromMe: true, to: groupId }));
+    await deliver(sourceMessage);
+    const before = firstStore.getRelaySource(groupId, sourceId)!;
+    expect(before.links.map((link) => link.plan?.items[0].status)).toEqual(['confirmed', 'failed', 'confirmed']);
+    expect(firstStore.countReposts()).toBe(2);
+    await firstBot.stop();
+    firstStore.close();
+    clients.length = 0;
+    mediaPaths.length = 0;
+    const secondStore = createStore(path);
+    const secondBot = createWhatsappBot({ config: baseConfig(), store: secondStore, downloader });
+    clients[0].getMessageById.mockResolvedValue(sourceMessage);
+    clients[0].sendMessage.mockResolvedValue({ id: { _serialized: 'confirmed-B' }, ack: 1, fromMe: true, to: groupId });
+    await clients[0].handlers.get('ready')?.();
+    expect(secondStore.getRelaySource(groupId, sourceId)).toEqual(before);
+    const command = (text: string, id: string, seconds: number) => Object.assign(fakeMessage(text, { id, timestamp: timestamp + seconds }),
+      { hasQuotedMsg: true, getQuotedMessage: vi.fn(async () => sourceMessage) });
+    const request = command('!bot retry', 'mixed-request', 1);
+    await clients[0].handlers.get('message')?.(request);
+    expect(request.reply).toHaveBeenCalledWith(expect.stringContaining('1 definitely pre-send item eligible: Link 2, item 1'));
+    failB = false;
+    await clients[0].handlers.get('message')?.(command('!bot retry confirm', 'mixed-confirm', 2));
+    expect(mediaPaths).toHaveLength(1);
+    expect(secondStore.countReposts()).toBe(3);
+    expect(secondStore.getRelaySource(groupId, sourceId)?.links.map((link) => link.plan?.items[0].status))
+      .toEqual(['confirmed', 'confirmed', 'confirmed']);
+    await secondBot.stop();
+    secondStore.close();
+    const thirdStore = createStore(path);
+    stores.push(thirdStore);
+    expect(thirdStore.getRelaySource(groupId, sourceId)).toMatchObject({ workReference: before.workReference,
+      acceptedAtMs: before.acceptedAtMs, cleanup: 'retained',
+      links: [{ plan: { items: [{ status: 'confirmed' }] } }, { plan: { items: [{ status: 'confirmed' }] } }, { plan: { items: [{ status: 'confirmed' }] } }] });
+    expect(thirdStore.countReposts()).toBe(3);
+  });
+
+  test('selected/full-collection overlap keeps skips and unknown holds protected through a retry window change', async () => {
+    const fixture = await retryCommandFixture();
+    const url = 'https://instagram.com/p/Post123/';
+    fixture.sourceMessage.body = url;
+    const source = fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)!;
+    source.contentHash = relayContentHash(url);
+    source.links = [{ url, platform: 'instagram', urlHash: 'full-post', status: 'ready', plan: {
+      parentId: 'post-1', totalItems: 3, items: [
+        { index: 1, kind: 'video', identity: { platform: 'instagram', postId: 'post-1', itemId: 'video-1' }, status: 'skipped' },
+        { index: 2, kind: 'video', identity: { platform: 'instagram', postId: 'post-1', itemId: 'video-2' }, status: 'failed' },
+        { index: 3, kind: 'video', identity: { platform: 'instagram', postId: 'post-1', itemId: 'video-3' }, status: 'held' },
+      ],
+    } }];
+    fixture.store.saveRelaySource(source);
+    const selectedKey = { groupId: fixture.groupId, messageId: 'selected-source', identity: source.links[0].plan!.items[0].identity! };
+    const selectedRecord = { groupId: fixture.groupId, senderId: source.senderId, url: `${url}?img_index=1`, urlHash: 'selected-post', createdAtMs: Date.now() };
+    fixture.store.beginMediaRepost(selectedKey, selectedRecord, 24);
+    fixture.store.confirmMediaRepost(selectedKey, { messageId: 'selected-confirmed', ack: 1 }, selectedRecord);
+    const unknownKey = { groupId: fixture.groupId, messageId: fixture.sourceId, identity: source.links[0].plan!.items[2].identity! };
+    fixture.store.beginMediaRepost(unknownKey, { ...selectedRecord, url, urlHash: 'full-post' }, 24);
+    fixture.store.recordMediaEvidence(unknownKey, { messageId: 'unknown-repost', ack: 0 });
+    fixture.downloader.resolveInstagram.mockImplementation(async () => ({ id: 'post-1', totalItems: 3,
+      items: [1, 2, 3].map((index) => ({ id: `video-${index}`, index, kind: 'video' as const,
+        download: (limit: number) => fixture.downloader.download(url, limit) })) }));
+    await fixture.request();
+    await clients[0].handlers.get('message')?.(fakeMessage('!bot set duplicate-window 0'));
+    const obsolete = fixture.command('!bot retry confirm', 'obsolete-confirm', 1);
+    await clients[0].handlers.get('message')?.(obsolete);
+    expect(obsolete.reply).toHaveBeenCalledWith(expect.stringContaining('No matching retry preview'));
+    const fresh = fixture.command('!bot retry', 'fresh-request', 2);
+    await clients[0].handlers.get('message')?.(fresh);
+    expect(fresh.reply).toHaveBeenCalledWith(expect.stringContaining('1 definitely pre-send item eligible: Link 1, item 2'));
+    clients[0].sendMessage.mockResolvedValue({ id: { _serialized: 'confirmed-item-2' }, ack: 1, fromMe: true, to: fixture.groupId });
+    await clients[0].handlers.get('message')?.(fixture.command('!bot retry confirm', 'fresh-confirm', 3));
+    expect(mediaPaths).toHaveLength(1);
+    expect(fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)?.links[0].plan?.items.map((item) => item.status))
+      .toEqual(['skipped', 'confirmed', 'held']);
+    expect(fixture.store.getMediaAttempt(unknownKey)).toMatchObject({ status: 'sending', sentMessageId: 'unknown-repost', ack: 0 });
+    expect(fixture.store.getMediaDisposition({ ...unknownKey, messageId: 'another-source' }, Date.now(), 0)).toBe('held');
+    expect(fixture.store.countReposts()).toBe(2);
   });
 
   test('allows group admin when message author uses LID and participant has phone id', async () => {
@@ -554,6 +1124,36 @@ function baseConfig() {
   };
 }
 
+async function retryCommandFixture() {
+  const store = createStore(':memory:');
+  stores.push(store);
+  const groupId = 'group-1@g.us';
+  const sourceId = 'retry-source';
+  const body = 'https://youtube.com/shorts/AbCdEf123_-';
+  const now = Date.now();
+  store.setGroupEnabled(groupId, true);
+  store.acceptRelaySource({ version: 1, groupId, messageId: sourceId, senderId: 'admin@c.us', senderName: 'Admin',
+    timestampMs: now, acceptedAtMs: now, contentHash: relayContentHash(body), status: 'settled', cleanup: 'retained',
+    links: [{ url: body, platform: 'youtube', urlHash: 'retry-hash', status: 'failed', plan: { parentId: 'AbCdEf123_-', totalItems: 1,
+      items: [{ index: 1, kind: 'video', identity: { platform: 'youtube', videoId: 'AbCdEf123_-' }, status: 'failed' }] } }] });
+  const sourceMessage = fakeMessage(body, { id: sourceId, timestamp: Math.floor(now / 1000) });
+  const downloader = fakeDownloader();
+  const { createWhatsappBot } = await import('../src/whatsapp');
+  const bot = createWhatsappBot({ config: baseConfig(), store, downloader });
+  clients[0].getMessageById.mockResolvedValue(sourceMessage);
+  await clients[0].handlers.get('ready')?.();
+  const command = (text: string, id: string, seconds = 0, author = 'admin@c.us') => Object.assign(
+    fakeMessage(text, { id, author, timestamp: Math.floor(now / 1000) + seconds }),
+    { hasQuotedMsg: true, getQuotedMessage: vi.fn(async () => sourceMessage) });
+  const request = async () => {
+    const message = command('!bot retry', 'request');
+    await clients[0].handlers.get('message')?.(message);
+    expect(message.reply).toHaveBeenCalledWith(expect.stringContaining('1 definitely pre-send item eligible'));
+    return message;
+  };
+  return { store, groupId, sourceId, sourceMessage, downloader, bot, command, request };
+}
+
 async function deliver(message: ReturnType<typeof fakeMessage>) {
   await clients[0].handlers.get('ready')?.();
   return clients[0].handlers.get('message')?.(message);
@@ -607,6 +1207,9 @@ function fakeMessage(
   options: {
     botIsAdmin?: boolean;
     fromMe?: boolean;
+    id?: string;
+    from?: string;
+    timestamp?: number;
     author?: string;
     contact?: Record<string, unknown>;
     participants?: Array<Record<string, unknown>>;
@@ -619,18 +1222,18 @@ function fakeMessage(
     { id: { _serialized: 'bot@c.us' }, isAdmin: botIsAdmin, isSuperAdmin: false },
   ];
   return {
-    id: { _serialized: 'message-1' },
-    from: 'group-1@g.us',
+    id: { _serialized: options.id ?? 'message-1' },
+    from: options.from ?? 'group-1@g.us',
     author: options.author ?? 'admin@c.us',
     body,
     links: options.links,
-    timestamp: 1,
+    timestamp: options.timestamp ?? 1,
     fromMe: options.fromMe ?? false,
     reply: vi.fn(),
     getContact: vi.fn(async () => options.contact ?? { pushname: 'Admin', name: 'Admin', number: 'admin' }),
     getChat: vi.fn(async () => ({
       isGroup: true,
-      id: { _serialized: 'group-1@g.us' },
+       id: { _serialized: options.from ?? 'group-1@g.us' },
       name: 'Group 1',
       participants,
     })),

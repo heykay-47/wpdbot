@@ -103,6 +103,27 @@ describe('createStore', () => {
     });
   });
 
+  it('persists validated group settings and advances a revision only when values change', () => {
+    const store = createTempStore();
+    const groupId = 'group-1@g.us';
+
+    expect(store.getGroupSettingsRevision(groupId)).toBe(0);
+    expect(store.setGroupSettings(groupId, { maxFileSizeMb: 48 })).toBe(true);
+    expect(store.setGroupSettings(groupId, { maxFileSizeMb: 48 })).toBe(false);
+    expect(store.setGroupSettings(groupId, { duplicateWindowHours: 0 })).toBe(true);
+
+    expect(store.getGroupSettings(groupId)).toEqual({
+      groupId,
+      enabled: false,
+      maxFileSizeMb: 48,
+      duplicateWindowHours: 0,
+    });
+    expect(store.getGroupSettingsRevision(groupId)).toBe(2);
+    expect(() => store.setGroupSettings(groupId, { maxFileSizeMb: 0 })).toThrow();
+    expect(() => store.setGroupSettings(groupId, { duplicateWindowHours: 721 })).toThrow();
+    expect(store.getGroupSettingsRevision(groupId)).toBe(2);
+  });
+
   it('scopes duplicate checks by group and time window', () => {
     const store = createTempStore();
     const createdAtMs = 1_000;

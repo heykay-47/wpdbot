@@ -6,6 +6,7 @@ import { prepareMedia } from '../src/mediaPreparation';
 
 const roots: string[] = [];
 afterEach(async () => {
+  vi.useRealTimers();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -111,6 +112,42 @@ it('passes compatible video through without re-encoding, including silent video'
   input.probe.streams.splice(1, 1);
   expect(await prepareMedia(input.filePath, 1, input.runner)).toEqual({ filePath: input.filePath, sizeBytes: 5, deliveryMode: 'video' });
   expect(input.runner).toHaveBeenCalledTimes(1);
+});
+
+it.each([0, 1])('enforces the exact byte boundary with %s excess bytes', async (excess) => {
+  const input = await fixture();
+  await writeFile(input.filePath, Buffer.alloc(1024 * 1024 + excess));
+  if (excess) await expect(prepareMedia(input.filePath, 1, input.runner)).rejects.toThrow('exceeds');
+  else expect(await prepareMedia(input.filePath, 1, input.runner)).toMatchObject({ sizeBytes: 1024 * 1024, deliveryMode: 'video' });
+});
+
+it.each(['120', '120.001'])('enforces the exact configured duration at %s seconds', async (duration) => {
+  const input = await fixture();
+  input.probe.format.duration = duration;
+  if (duration === '120') expect((await prepareMedia(input.filePath, 1, input.runner, 120)).deliveryMode).toBe('video');
+  else await expect(prepareMedia(input.filePath, 1, input.runner, 120)).rejects.toThrow('exceeds');
+});
+
+it('falls back only to the validated original after the simulated two-minute conversion timeout', async () => {
+  const input = await fixture();
+  input.probe.streams[0].codec_name = 'vp9';
+  vi.useFakeTimers();
+  let timeoutScheduled = false;
+  input.runner.mockImplementation(async (file, args, timeoutMs) => {
+    if (file !== 'ffmpeg') return { stdout: JSON.stringify(input.probe) };
+    await writeFile(args.at(-1)!, 'partial conversion');
+    return new Promise((_resolve, reject) => {
+      setTimeout(() => reject(Object.assign(new Error('Synthetic conversion timeout'), { timedOut: true })), timeoutMs);
+      timeoutScheduled = true;
+    });
+  });
+  const preparing = prepareMedia(input.filePath, 1, input.runner, 120);
+  await vi.waitFor(() => expect(timeoutScheduled).toBe(true));
+  expect(input.runner).toHaveBeenCalledWith('ffmpeg', expect.any(Array), 120_000);
+  await vi.advanceTimersByTimeAsync(120_000);
+  expect(await preparing).toEqual({ filePath: input.filePath, sizeBytes: 5, deliveryMode: 'document' });
+  await expect(readFile(`${input.filePath}.whatsapp.mp4`)).rejects.toThrow();
+  expect(input.runner.mock.calls.filter(([file]) => file === 'ffmpeg')).toHaveLength(1);
 });
 
 it.each([

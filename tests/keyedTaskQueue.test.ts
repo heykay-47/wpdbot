@@ -31,6 +31,19 @@ describe('KeyedTaskQueue', () => {
     expect(events).toEqual(['first:start', 'first:end', 'second:start']);
   });
 
+  it('rejects an immediate retry reservation instead of waiting behind active source work', async () => {
+    const queue = new KeyedTaskQueue();
+    const gate = deferred();
+    const first = queue.run('group:source', async () => gate.promise);
+    await Promise.resolve();
+
+    expect(queue.has('group:source')).toBe(true);
+    expect(queue.runIfIdle('group:source', async () => undefined)).toBeNull();
+    gate.resolve();
+    await first;
+    await expect(queue.runIfIdle('group:source', async () => 'admitted')).resolves.toBe('admitted');
+  });
+
   it('allows different keys to run concurrently', async () => {
     const queue = new KeyedTaskQueue();
     const gate = deferred();
