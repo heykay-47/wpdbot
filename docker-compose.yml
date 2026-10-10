@@ -14,10 +14,17 @@ services:
       DOWNLOAD_DIR: /tmp/wpdbot-downloads
       WHATSAPP_AUTH_DIR: /app/.wwebjs_auth
       WHATSAPP_CACHE_DIR: /app/.wwebjs_cache
+      YT_DLP_COOKIES_PATH: ${YT_DLP_COOKIES_HOST_PATH:+/run/secrets/yt-dlp-cookies.txt}
     restart: unless-stopped
     stop_grace_period: 35s
     logging:
       driver: "none"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/ready').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 60s
     depends_on:
       - bgutil-provider
     volumes:
@@ -25,7 +32,12 @@ services:
       - wpdbot-cache:/app/.wwebjs_cache
       - wpdbot-data:/data
       - wpdbot-downloads:/tmp/wpdbot-downloads
-      - /root/wpdbot/youtube-cookies.txt:/cookies/youtube-cookies.txt
+      - type: bind
+        source: ${YT_DLP_COOKIES_HOST_PATH:-/dev/null}
+        target: /run/secrets/yt-dlp-cookies.txt
+        read_only: true
+        bind:
+          create_host_path: false
 
 volumes:
   wpdbot-auth:

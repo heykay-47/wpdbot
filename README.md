@@ -105,12 +105,13 @@ Node 24 is the supported runtime for local development and Docker. Node 20 is no
    BOT_OWNER_ID=919999999999@c.us
    SQLITE_PATH=/data/bot.db
    TIMEZONE=Asia/Kolkata
-    MAX_FILE_SIZE_MB=64
-    MAX_MEDIA_SIZE_MB=64
+   MAX_FILE_SIZE_MB=64
+   MAX_MEDIA_SIZE_MB=64
    DUPLICATE_WINDOW_HOURS=24
    DOWNLOAD_DIR=/tmp/wpdbot-downloads
    MAX_DURATION_SECONDS=
    YT_DLP_COOKIES_PATH=
+   YT_DLP_COOKIES_HOST_PATH=
    YT_DLP_PROXY=
    CONCURRENT_DOWNLOADS=1
    ```
@@ -118,9 +119,9 @@ Node 24 is the supported runtime for local development and Docker. Node 20 is no
 4. Build the bot and stop its normal service before private login:
 
    ```sh
-    docker compose build
-    docker compose stop wpdbot
-    docker compose run --rm --no-deps wpdbot node dist/entrypoint.js login
+   docker compose build
+   docker compose stop wpdbot
+   docker compose run --rm --no-deps wpdbot node dist/entrypoint.js login
    ```
 
 5. Scan the QR in that private interactive terminal, then run `docker compose up -d`. Never record/share the terminal. The one-shot flow exits after authentication, timeout or interruption; it does not relay. A noninteractive invocation refuses to expose a QR. The daemon never prints one.
@@ -152,7 +153,8 @@ Configure the bot with `.env`.
 | `WHATSAPP_CACHE_DIR` | Docker: `/app/.wwebjs_cache` | Optional WhatsApp cache directory override. Usually leave unset outside Docker. |
 | `DIAGNOSTICS_DIR` | Docker: `/app/.diagnostics`; local: `.diagnostics` | Private, regenerable allowlisted diagnostics, bounded to seven days and 30 MiB total. Keep separate from database/auth volumes. |
 | `MAX_DURATION_SECONDS` | empty | Optional global maximum video duration in seconds, checked against known metadata and the probed final file. Unknown final duration rejects when configured. Leave empty to disable the limit. |
-| `YT_DLP_COOKIES_PATH` | empty | Optional path to a private Netscape cookies file for authenticated `yt-dlp` downloads. Never commit this file; mount it as a secret/volume and do not `COPY` it into a Docker image. |
+| `YT_DLP_COOKIES_PATH` | empty | Optional cookies-file path for local runs. In Compose, the app path is set to `/run/secrets/yt-dlp-cookies.txt` only when `YT_DLP_COOKIES_HOST_PATH` is configured. |
+| `YT_DLP_COOKIES_HOST_PATH` | empty | Optional host-side cookies-file path for Compose. The file is mounted read-only at `/run/secrets/yt-dlp-cookies.txt`; keep it outside the repository. |
 | `YT_DLP_PROXY` | empty | Optional proxy URL passed to `yt-dlp` for network or region workarounds. |
 | `CONCURRENT_DOWNLOADS` | `1` | Maximum concurrent active downloads. Keep `1` for personal reliability. |
 
@@ -180,51 +182,137 @@ Settings and retry commands are available while a group is disabled; retry itsel
 
 Every durably accepted source has a persistent random `W-…` reference. Equivalent links in different sources have different references; references grant no access. A settled source may still have failed items. Inspection uses saved outcomes and exact stored attempt evidence, not guessed historical causes/counts/times. Unsupported saved records remain untouched and held, without blocking unrelated supported recovery. Source inspection reports cleanup eligibility or the one recorded cleanup outcome without claiming group-wide removal.
 
-### Private diagnostics and login
+## Operator Runbook
 
-Ordinary Docker output is disabled for the bot and token-provider containers. The daemon also discards third-party stdout/stderr; unexpected errors never fall back to raw messages/stacks. Operator diagnostics are JSONL files with allowlisted stage, timestamp, safe cause, platform, opaque reference and saved positions. No source URLs/hashes, identities, raw IDs, prose, stderr, commands, paths, payloads, secrets or QR data are included. Expected failures are logged too; unknown causes remain unknown. Reporter failure never changes delivery evidence or authorizes another send.
+Use this runbook for one private instance. It describes offline operations; it does not authorize live-account testing or deployment changes.
 
-Read only the bounded private diagnostics in the running container:
+### First setup and updates
+
+For first setup, follow Quick Start. Keep `.env`, the auth volume, and the database private. Before an update, take a paired backup as described below. Stop the relay before changing versions; never run old and new versions concurrently against one database.
+
+```sh
+docker compose stop wpdbot
+git fetch origin
+git checkout master
+git pull --ff-only origin master
+docker compose build --pull
+docker compose up -d wpdbot
+```
+
+If the checkout has local changes, inspect and preserve them before pulling. Do not blindly overwrite host configuration.
+
+### Health, status, and deliberate restart
+
+`docker compose ps` reports both process state and the Docker health status. `healthy` means the readiness check currently sees an open SQLite store and an authenticated and ready WhatsApp client. Process liveness is distinct from relay readiness: the process can remain running while readiness is false. The health endpoint is loopback-only on port 3000; it is not published to the host. `/health/live` reports that the process can answer requests, while `/health/ready` reports relay readiness.
+
+Readiness is passive: it does not restart the container, log out, or delete authentication data. Existing `unless-stopped` behavior applies to process or host exits. Missing group-admin permission and an individual blocked download are group/operation problems, not global health failures. An unhealthy container is not automatically restarted by this health check.
+
+Inspect only the allowlisted private diagnostics when readiness is unhealthy:
 
 ```sh
 docker compose exec wpdbot sh -c 'cat /app/.diagnostics/*.jsonl'
 ```
 
-Files rotate at 1 MiB, evict oldest entries before exceeding 30 MiB total, and expire conservatively within seven days while running (including idle maintenance). Startup prunes expired/oversized files before use. Container recreation discards these regenerable diagnostics, not durable data. Do not persist them in SQLite/auth volumes or use Docker log overrides to capture raw output. Never upload diagnostics automatically. Public support should contain synthetic examples only, not private database/auth/cache files or terminal recordings.
+Ordinary Docker output is disabled for the bot and token-provider. The daemon discards third-party stdout/stderr; diagnostics contain allowlisted stage, timestamp, safe cause, platform, opaque reference, and saved positions only. They omit URLs/hashes, identities, raw IDs, prose, stacks, stderr, commands, paths, payloads, secrets, and QR data. Unknown causes remain unknown, and reporting failures cannot change delivery evidence. Files rotate at 1 MiB, stay within 30 MiB total, and expire within seven days. Diagnostics are regenerable, not relay history; never upload them automatically.
 
-For authentication intervention, stop `wpdbot`, invoke the private one-shot login command above against the same auth volume, then start `wpdbot`. A shared OS-backed auth-profile lock prevents this version's daemon and login process from running together and releases on process exit. Never run an older version concurrently or automatically logout/delete/relink the session. Health/readiness, portable cookies and the full paired backup/restore runbook remain Stage 4 work.
-
-## Operations
-
-Common Docker commands:
+For a diagnosed transient WhatsApp disconnect, perform one deliberate graceful restart:
 
 ```sh
-docker compose up -d        # Start in background
-docker compose exec wpdbot sh -c 'cat /app/.diagnostics/*.jsonl' # Private safe diagnostics
-docker compose restart      # Restart service
-docker compose down         # Stop without deleting volumes
-docker compose build        # Rebuild image
-docker compose build --no-cache
+docker compose restart wpdbot
 ```
 
-Update an existing server checkout:
+Shutdown stops new work, allows active submissions up to 30 seconds to record evidence, then destroys the client without logout and closes SQLite. Compose allows 35 seconds before forced termination. If readiness remains unhealthy after one restart, stop and diagnose; do not create a restart loop. Fix missing admin permission in the group. For storage errors, preserve the data and auth volumes and repair storage. For blocked downloads, verify network/cookie configuration; only use the existing authorized targeted retry for definitely pre-intent work. Never retry delivery-unknown work.
+
+### Private login
+
+If diagnostics indicate authentication intervention, stop the normal service and run the one-shot login in a private interactive terminal against its existing auth volume:
 
 ```sh
-git fetch origin
-git checkout master
-git pull --ff-only origin master
-docker compose build --pull
-docker compose up -d
+docker compose stop wpdbot
+docker compose run --rm --no-deps wpdbot node dist/entrypoint.js login
+docker compose up -d wpdbot
 ```
 
-If the server has local changes, inspect and save them before pulling:
+Scan the transient QR only in that terminal; do not record or share it. The flow does not relay and exits after authentication, timeout, or interruption. The daemon never prints a QR. A shared OS-backed auth-profile lock prevents this version's daemon and login process from running together. Never automatically log out, delete auth state, relink, or run another version against the same auth/database volumes.
+
+### Optional cookies
+
+For Docker, leave `YT_DLP_COOKIES_HOST_PATH` empty to run without cookies. When needed, set it in the private `.env` to the host-side path of an existing Netscape-format cookies file. Compose mounts that file read-only at `/run/secrets/yt-dlp-cookies.txt` and sets the app's `YT_DLP_COOKIES_PATH` to that stable container path. The file is optional; without it, cookie-backed downloads are unavailable. The container runs as UID 10001; ensure that UID can read the file and traverse its parent directories without making the file broadly readable. Keep the file outside source control and do not put its contents or host path in diagnostics. Recreate the service after changing the configured mount or replacing the file contents, especially if the host replaces it by renaming a new file over the old one:
 
 ```sh
-git status
-git diff
-git stash push -m "server local changes"
-git pull --ff-only origin master
+docker compose up -d --force-recreate wpdbot
 ```
+
+### Paired backup and restore
+
+Create a paired, quiesced snapshot of SQLite and WhatsApp LocalAuth together for the same instance. Ensure no one-shot login or second version is running. This helper assumes the normal service should be running afterward: it stops `wpdbot` for the snapshot and starts it again when finished. If the service is intentionally stopped, do not run this helper unchanged. The following encrypts the archive with GnuPG symmetric AES-256; install GnuPG on the host if needed, choose a strong passphrase, and store it separately from the archive. The plaintext archive streams directly from the container into GnuPG and is not written to the host filesystem. Run this Bash snippet with a private backup directory that has enough space:
+
+```bash
+set -euo pipefail
+backup_dir="$HOME/wpdbot-backups"
+umask 077
+mkdir -p "$backup_dir"
+chmod 700 "$backup_dir"
+snapshot="$(mktemp --suffix=.tar.gz.gpg "$backup_dir/wpdbot-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
+stopped=0
+complete=0
+cleanup() {
+  status=$?
+  trap - EXIT
+  if [ "$complete" -ne 1 ]; then rm -f -- "$snapshot" || true; fi
+  if [ "$stopped" -eq 1 ]; then docker compose start wpdbot || true; fi
+  exit "$status"
+}
+trap cleanup EXIT
+
+docker compose stop wpdbot
+stopped=1
+docker compose run --rm --no-deps -T --entrypoint sh wpdbot -ec \
+  'test -f /data/bot.db && test -d /app/.wwebjs_auth && tar -C / -czf - data app/.wwebjs_auth' |
+  gpg --symmetric --cipher-algo AES256 --yes --output "$snapshot"
+chmod 600 "$snapshot"
+complete=1
+docker compose start wpdbot
+stopped=0
+trap - EXIT
+```
+
+Treat the encrypted archive like the logged-in WhatsApp account. Store it in a private location and label the instance and snapshot time outside the repository. Cache and downloads are regenerable and are not part of the snapshot.
+
+Restore only the exact SQLite/LocalAuth pair for the same instance, while stopped, when no later WhatsApp sends may have occurred. A restore rolls back local evidence; if the account may have sent or received work since the snapshot, do not restore it. Never restore SQLite alone or combine a database with a different/stale auth profile. Keep the service stopped if any restore step fails; start it only after both volumes have been restored.
+
+```bash
+set -eu
+umask 077
+snapshot="/absolute/private/path/to/wpdbot-snapshot.tar.gz.gpg"
+test -r "$snapshot"
+restore_dir="$(mktemp -d "$HOME/wpdbot-restore.XXXXXX")"
+trap 'rm -rf -- "$restore_dir"' EXIT
+chmod 700 "$restore_dir"
+gpg --decrypt --output "$restore_dir/snapshot.tar.gz" "$snapshot"
+chmod 600 "$restore_dir/snapshot.tar.gz"
+tar -tzf "$restore_dir/snapshot.tar.gz" >/dev/null
+docker compose stop wpdbot
+docker compose run --rm --no-deps -T \
+  -v "$restore_dir/snapshot.tar.gz:/restore/snapshot.tar.gz:ro" --user 0:0 \
+  --entrypoint sh wpdbot -ec '
+    mkdir -p /tmp/wpdbot-restore
+    tar -xzf /restore/snapshot.tar.gz -C /tmp/wpdbot-restore
+    test -f /tmp/wpdbot-restore/data/bot.db
+    test -d /tmp/wpdbot-restore/app/.wwebjs_auth
+    find /data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    cp -a /tmp/wpdbot-restore/data/. /data/
+    find /app/.wwebjs_auth -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    cp -a /tmp/wpdbot-restore/app/.wwebjs_auth/. /app/.wwebjs_auth/
+  '
+docker compose start wpdbot
+```
+
+Decryption and archive validation happen before the service stops or either volume changes. The temporary plaintext restore file lives in a mode-0700 private directory and is removed when the shell exits. The restore helper runs only while the service is stopped; root is used in this disposable helper so the original volume ownership can be preserved. Review the selected snapshot path and same-instance/no-later-sends conditions before running it. After restart, confirm Docker readiness and inspect saved work before any recovery action. Missing history or visual absence never proves non-delivery.
+
+### Exact-ID reconciliation
+
+The bot reconciles only an already-stored repost message ID in its originating group, using positive WhatsApp history/acknowledgement evidence. Do not issue raw-ID group commands or treat a failed lookup, missing history, or visual absence as proof that a send did not happen. No negative-evidence override grants a retry.
 
 ## Persistent Data
 
@@ -334,9 +422,9 @@ After pulling, reapply only the changes you still need.
 
 YouTube can enforce PO (Proof of Origin) Token authentication or require source access. Failures now produce safe group feedback and allowlisted diagnostics. An unspecified upstream exception remains an unknown cause; raw stderr is never shown or logged. Contact the operator rather than posting cookies, URLs, raw errors or credentials into support.
 
-Two things must be in place for YouTube Shorts to work reliably from a cloud server:
+Reliable cloud downloads use the PO token sidecar. Some sources additionally require authenticated cookies; cookie configuration remains optional:
 
-**1. PO token sidecar (`bgutil-ytdlp-pot-provider`)**
+**1. PO token sidecar (`bgutil-ytdlp-pot-provider`; included in this Compose setup)**
 
 The `docker-compose.yml` in this repository includes a `bgutil-provider` sidecar service that runs `brainicism/bgutil-ytdlp-pot-provider`. The Docker image installs the matching yt-dlp plugin and a `/etc/yt-dlp.conf` pointing at the sidecar. If you pulled a version of the repository before this was added, rebuild:
 
@@ -353,21 +441,9 @@ docker ps                          # bgutil-provider should be Up
 
 Do not capture verbose downloader output in ordinary logs or public support. Live source checks require separate authorization and private scope.
 
-**2. YouTube cookies (`YT_DLP_COOKIES_PATH`)**
+**2. Optional cookies**
 
-Even with PO tokens, YouTube requires an authenticated session from datacenter IPs. Export a Netscape-format cookies file from a browser logged into a YouTube/Google account, place it on the server (e.g. `/root/wpdbot/youtube-cookies.txt`), and set in `.env`:
-
-```env
-YT_DLP_COOKIES_PATH=/cookies/youtube-cookies.txt
-```
-
-The `docker-compose.yml` volume-mounts `/root/wpdbot/youtube-cookies.txt` to `/cookies/youtube-cookies.txt` inside the container. After editing `.env`, force-recreate the container to apply the change:
-
-```sh
-docker compose up -d --force-recreate wpdbot
-```
-
-**Note:** Cookies expire. If downloads start failing again after previously working, re-export fresh cookies from your browser and replace the file on the server. Restart the container after replacing the file.
+Some source downloads may require authenticated access. Docker cookie configuration is optional; follow the Operator Runbook's optional-cookie instructions for its read-only mount. Cookies can expire. If a source stops working after previously succeeding, check the private cookie file and network configuration without posting cookies, paths, URLs, or raw errors in support.
 
 ### Refresh `yt-dlp` And Chrome Dependencies
 
@@ -389,7 +465,7 @@ docker compose up -d
 
 ### Authentication Failure
 
-Preserve database and LocalAuth data. Diagnose privately, then use the stopped-service one-shot login flow if authentication intervention is needed. Do not delete auth/database volumes to force recovery. Never restore a database alone or roll back a stale snapshot after later sends; paired quiesced backup/restore guidance belongs to Stage 4.
+Preserve database and LocalAuth data. Diagnose privately, then use the stopped-service one-shot login flow if authentication intervention is needed. Do not delete auth/database volumes to force recovery. Never restore a database alone or roll back a stale snapshot after later sends; follow the paired quiesced backup/restore section in the Operator Runbook.
 
 ## Manual Smoke Test
 

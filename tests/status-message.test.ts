@@ -160,6 +160,39 @@ describe('createWhatsappBot', () => {
     await vi.waitFor(() => expect(clients[0].initialize).toHaveBeenCalledOnce());
   });
 
+  test('readiness follows SQLite and authenticated WhatsApp state without restarting on disconnect', async () => {
+    const store = createStore(':memory:');
+    stores.push(store);
+    store.setGroupEnabled('group-1@g.us', true);
+    const downloader = fakeDownloader();
+    downloader.download.mockRejectedValue(new Error('synthetic source block'));
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const bot = createWhatsappBot({ config: baseConfig(), store, downloader });
+
+    expect(bot.isReady()).toBe(false);
+    bot.start();
+    await vi.waitFor(() => expect(clients[0].initialize).toHaveBeenCalledOnce());
+
+    clients[0].emit('ready');
+    expect(bot.isReady()).toBe(true);
+    await clients[0].handlers.get('message')?.(fakeMessage('!bot status', { botIsAdmin: false }));
+    await clients[0].handlers.get('message')?.(fakeMessage('https://youtube.com/shorts/AbCdEf123_-', { botIsAdmin: false }));
+    expect(downloader.download).toHaveBeenCalledOnce();
+    expect(bot.isReady()).toBe(true);
+    clients[0].emit('disconnected');
+    expect(bot.isReady()).toBe(false);
+    expect(clients[0].initialize).toHaveBeenCalledOnce();
+
+    clients[0].emit('ready');
+    expect(bot.isReady()).toBe(true);
+    clients[0].emit('auth_failure', 'PRIVATE-AUTH-DETAIL');
+    expect(bot.isReady()).toBe(false);
+
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    expect(bot.isReady()).toBe(false);
+  });
+
   test('recovers accepted work only after the client is ready, using exact source lookup', async () => {
     const store = fakeStore();
     store.getGroupSettings.mockReturnValue({ groupId: 'group-1@g.us', enabled: true, maxFileSizeMb: 64, duplicateWindowHours: 24 });

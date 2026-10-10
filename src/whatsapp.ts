@@ -35,6 +35,7 @@ export type WhatsappRelay = {
 export type WhatsappBot = {
   client: InstanceType<typeof Client>;
   relayWhatsapp: WhatsappRelay;
+  isReady(): boolean;
   start(): void;
   stop(): Promise<void>;
 };
@@ -281,6 +282,9 @@ export function createWhatsappBot({ config, store, downloader, queue, runtimePat
   return {
     client,
     relayWhatsapp,
+    isReady() {
+      return store.isOpen() && control.canSubmit() && Boolean(client.info);
+    },
     start() {
       void prepareWhatsappRuntime(runtimePaths)
         .then(() => { if (!control.isStopping()) return client.initialize(); })

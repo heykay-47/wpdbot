@@ -1,10 +1,12 @@
 import 'dotenv/config';
 import { loadConfig } from './config.js';
 import { createDownloader } from './downloader.js';
+import { messageForError } from './errorReporter.js';
 import { KeyedTaskQueue } from './keyedTaskQueue.js';
 import { createStore, type Store } from './store.js';
 import { createWhatsappBot, type WhatsappBot } from './whatsapp.js';
 import { acquireAuthLock } from './authLock.js';
+import { createHealthServer } from './health.js';
 import { resolveWhatsappRuntimePaths } from './whatsappRuntime.js';
 
 export function main(logger?: (entry: Record<string, unknown>) => void): void {
@@ -28,8 +30,10 @@ export function main(logger?: (entry: Record<string, unknown>) => void): void {
   });
   const queue = new KeyedTaskQueue(config.concurrentDownloads);
   const bot = createWhatsappBot({ config, store, downloader, queue, logger });
+  const health = createHealthServer(() => bot.isReady());
+  void health.listen().catch((error: unknown) => { messageForError(error, { step: 'runtime', logger }); });
 
-  installShutdownHandlers(bot, { close() { store.close(); release(); } });
+  installShutdownHandlers(bot, { close() { void health.close().catch(() => undefined); store.close(); release(); } });
   bot.start();
 }
 

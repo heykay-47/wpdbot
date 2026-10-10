@@ -87,6 +87,7 @@ export type Store = {
   getMediaAttempt(key: MediaRepostKey): MediaAttempt | null;
   recordMediaEvidence(key: MediaRepostKey, evidence: RepostEvidence): void;
   countReposts(): number;
+  isOpen(): boolean;
   close(): void;
 };
 
@@ -811,6 +812,10 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
 
     countReposts() {
       return selectRepostCount.get()?.count ?? 0;
+    },
+
+    isOpen() {
+      return db.open;
     },
 
     close() {
