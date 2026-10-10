@@ -170,10 +170,10 @@ export async function prepareRetryWork(
   return { sourceAfter, targets };
 }
 
-export async function retryLinkPlanMatches(link: RelaySource['links'][number], downloader: Pick<Downloader, 'resolveYouTube' | 'resolveInstagram'>): Promise<boolean> {
-  if (!link.plan) return false;
-  try { return planSignature(await resolvePlan(link, downloader)) === planSignature(link.plan); }
-  catch { return false; }
+export async function checkRetryLinkPlan(link: RelaySource['links'][number], downloader: Pick<Downloader, 'resolveYouTube' | 'resolveInstagram'>): Promise<'matching' | 'changed' | 'unavailable'> {
+  if (!link.plan) return 'unavailable';
+  try { return planSignature(await resolvePlan(link, downloader)) === planSignature(link.plan) ? 'matching' : 'changed'; }
+  catch { return 'unavailable'; }
 }
 
 export function sameRetrySource(left: RelaySource, right: RelaySource): boolean {

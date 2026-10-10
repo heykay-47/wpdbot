@@ -29,9 +29,23 @@ it('preserves the complete legacy/current evidence fixture through upgrade and t
     const legacy = { groupId: 'group', messageId: 'legacy-confirmed', postId: 'post', itemId: 'done-item' };
     initial.beginInstagramItem(legacy, 600);
     initial.confirmInstagramItem(legacy, { messageId: 'legacy-sent', ack: 1 }, record);
+    const currentSource: RelaySource = {
+      version: 2, groupId: 'group', messageId: 'new-source', senderId: 'sender', senderName: 'Name',
+      timestampMs: 100, acceptedAtMs: 300, contentHash: 'b'.repeat(64), status: 'settled',
+      cleanup: { version: 1, initial: 'link-only', initialFingerprint: 'b'.repeat(64), disqualifications: [],
+        intentRecorded: false, outcome: 'not-attempted', noticeClaimed: false, deferredReason: 'authority-unavailable' },
+      links: [{ url: 'https://youtube.com/shorts/NewSrc12345', platform: 'youtube', urlHash: 'new-hash', status: 'ready',
+        plan: { parentId: 'NewSrc12345', totalItems: 1,
+          items: [{ index: 1, kind: 'video', identity: { platform: 'youtube', videoId: 'NewSrc12345' }, status: 'confirmed' }] } }],
+    };
+    initial.acceptRelaySource(currentSource);
+    const currentKey = { groupId: 'group', messageId: 'new-source', identity: { platform: 'youtube' as const, videoId: 'NewSrc12345' } };
+    const currentRecord = { groupId: 'group', senderId: 'sender', url: currentSource.links[0].url, urlHash: 'new-hash', createdAtMs: 3_000 };
+    initial.beginMediaRepost(currentKey, currentRecord, 24, undefined, 'video');
+    initial.confirmMediaRepost(currentKey, { messageId: 'new-sent', ack: 1 }, currentRecord);
     initial.close();
     const db = new Database(path);
-    db.exec('DROP TABLE relay_references; UPDATE group_settings SET max_file_size_mb=999, duplicate_window_hours=999;');
+    db.exec('DROP TABLE relay_references; ALTER TABLE media_relay_attempts DROP COLUMN delivery_mode; UPDATE group_settings SET max_file_size_mb=999, duplicate_window_hours=999;');
     db.prepare('INSERT INTO relay_sources VALUES(?,?,?)').run('group', 'source', JSON.stringify(source));
     const tables = ['group_settings', 'duplicate_urls', 'repost_history', 'bot_identity', 'media_relay_attempts', 'instagram_relay_items', 'relay_sources'];
     const before = Object.fromEntries(tables.map((table) => [table, db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]));
@@ -41,13 +55,24 @@ it('preserves the complete legacy/current evidence fixture through upgrade and t
       const store = createStore(path);
       reference ??= store.getRelaySource('group', 'source')!.workReference;
       expect(store.getRelaySource('group', 'source')!.workReference).toBe(reference);
+      expect(store.getRelaySource('group', 'source')).toMatchObject({ version: 1, cleanup: 'retained' });
+      expect(store.getRelaySource('group', 'new-source')).toMatchObject({ version: 2,
+        cleanup: { initial: 'link-only', intentRecorded: false, outcome: 'not-attempted', deferredReason: 'authority-unavailable' } });
       expect(store.getMediaDisposition(confirmed, 999999999, 0)).toBe('completed');
       expect(store.getMediaDisposition({ ...confirmed, messageId: 'later', identity: { platform: 'youtube', videoId: 'Another123_' } }, 999999999, 0)).toBe('held');
       expect(store.getMediaDisposition({ groupId: 'group', messageId: 'later', identity: { platform: 'instagram', postId: 'post', itemId: 'held-item' } }, 999999999, 0)).toBe('held');
       store.close();
       const check = new Database(path);
-      for (const table of tables) expect(check.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()).toEqual(before[table]);
+      for (const table of tables) {
+        const priorRows = before[table] as Array<Record<string, unknown>>;
+        const priorColumns = Object.keys(priorRows[0] ?? {});
+        const currentRows = check.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all() as Array<Record<string, unknown>>;
+        expect(currentRows.map((row) => Object.fromEntries(priorColumns.map((column) => [column, row[column]]))))
+          .toEqual(priorRows);
+      }
       expect(check.prepare('SELECT confirmed_at_ms FROM media_relay_attempts WHERE message_id=?').get('unknown')).toEqual({ confirmed_at_ms: null });
+      expect(check.prepare('SELECT delivery_mode FROM media_relay_attempts WHERE message_id=?').get('source')).toEqual({ delivery_mode: null });
+      expect(check.prepare('SELECT delivery_mode FROM media_relay_attempts WHERE message_id=?').get('new-source')).toEqual({ delivery_mode: null });
       check.close();
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }

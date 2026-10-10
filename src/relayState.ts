@@ -18,8 +18,7 @@ export type RelayLink = {
   plan: RelayPlan | null;
 };
 
-export type RelaySource = {
-  version: 1;
+type RelaySourceFields = {
   workReference?: string;
   groupId: string;
   messageId: string;
@@ -30,11 +29,44 @@ export type RelaySource = {
   contentHash: string;
   status: 'ready' | 'paused' | 'held' | 'settled';
   holdReason?: string;
-  cleanup: 'retained';
   links: RelayLink[];
 };
 
+export type CleanupDisqualification = 'prior-message-duplicate' | 'skipped-media' | 'document-repost'
+  | 'source-edited' | 'media-plan-changed' | 'expired' | 'clock-uncertain';
+export type CleanupOutcome = 'not-attempted' | 'unknown' | 'not-invoked' | 'threw' | 'returned-unverified';
+export type CleanupDeferral = 'media-unconfirmed' | 'group-disabled' | 'source-missing' | 'source-unavailable'
+  | 'authority-unavailable' | 'client-unavailable' | 'storage-unavailable';
+export type CleanupEvidence = {
+  version: 1;
+  initial: 'link-only' | 'mixed-content';
+  initialFingerprint: string;
+  disqualifications: CleanupDisqualification[];
+  intentRecorded: boolean;
+  outcome: CleanupOutcome;
+  noticeClaimed: boolean;
+  deferredReason?: CleanupDeferral;
+};
+
+type LegacyRelaySource = RelaySourceFields & { version: 1; cleanup: 'retained' };
+type CurrentRelaySource = RelaySourceFields & { version: 2; cleanup: CleanupEvidence };
+export type RelaySource = LegacyRelaySource | CurrentRelaySource;
+
+const cleanupDisqualifications = new Set<CleanupDisqualification>([
+  'prior-message-duplicate', 'skipped-media', 'document-repost', 'source-edited', 'media-plan-changed', 'expired', 'clock-uncertain',
+]);
+const cleanupDeferrals = new Set<CleanupDeferral>([
+  'media-unconfirmed', 'group-disabled', 'source-missing', 'source-unavailable',
+  'authority-unavailable', 'client-unavailable', 'storage-unavailable',
+]);
+
 export class UnsupportedRelayStateError extends Error {}
+
+export function addCleanupDisqualification(source: RelaySource, reason: CleanupDisqualification): boolean {
+  if (source.version !== 2 || source.cleanup.disqualifications.includes(reason)) return false;
+  source.cleanup.disqualifications.push(reason);
+  return true;
+}
 
 export function serializeRelaySource(source: RelaySource): string {
   const { workReference: _workReference, ...persisted } = source;
@@ -47,12 +79,31 @@ export function validateRelaySource(source: RelaySource): void {
 }
 
 function validateSource(source: RelaySource): void {
-  if (!source || source.version !== 1 || source.cleanup !== 'retained'
+  if (!source || ![1, 2].includes(source.version)
     || !['ready', 'paused', 'held', 'settled'].includes(source.status)
     || ![source.groupId, source.messageId, source.senderId, source.senderName, source.contentHash].every((value) => typeof value === 'string' && value.length > 0)
     || !/^[0-9a-f]{64}$/u.test(source.contentHash)
     || !Number.isSafeInteger(source.timestampMs) || !Number.isSafeInteger(source.acceptedAtMs)
     || !Array.isArray(source.links) || !source.links.length) throw new Error('Durable source state is invalid or unsupported');
+  if (source.version === 1) {
+    if (source.cleanup !== 'retained') throw new Error('Legacy cleanup state is invalid');
+  } else {
+    const cleanup = source.cleanup;
+    if (!cleanup || cleanup.version !== 1 || !['link-only', 'mixed-content'].includes(cleanup.initial)
+      || cleanup.initialFingerprint !== source.contentHash || !Array.isArray(cleanup.disqualifications)
+      || cleanup.disqualifications.some((reason) => !cleanupDisqualifications.has(reason))
+      || new Set(cleanup.disqualifications).size !== cleanup.disqualifications.length
+      || typeof cleanup.intentRecorded !== 'boolean'
+      || !['not-attempted', 'unknown', 'not-invoked', 'threw', 'returned-unverified'].includes(cleanup.outcome)
+      || typeof cleanup.noticeClaimed !== 'boolean'
+      || (cleanup.deferredReason !== undefined && (!cleanupDeferrals.has(cleanup.deferredReason) || cleanup.intentRecorded))
+      || (!cleanup.intentRecorded && (cleanup.outcome !== 'not-attempted' || cleanup.noticeClaimed))
+      || (cleanup.intentRecorded && cleanup.outcome === 'not-attempted')
+      || (cleanup.initial === 'mixed-content' && cleanup.intentRecorded)
+      || (cleanup.noticeClaimed && !['not-invoked', 'threw'].includes(cleanup.outcome))) {
+      throw new Error('Durable cleanup evidence is invalid or unsupported');
+    }
+  }
   for (const link of source.links) {
     if (!link || !['ready', 'failed', 'skipped'].includes(link.status) || typeof link.urlHash !== 'string'
       || typeof link.url !== 'string' || extractSupportedUrls(link.url)[0]?.url !== link.url

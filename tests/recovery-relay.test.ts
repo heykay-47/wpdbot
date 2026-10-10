@@ -150,7 +150,14 @@ it.each(['missing', 'changed', 'wrong-group', 'wrong-sender', 'lookup-error'] as
   });
   await recoverRelaySources(input);
   expect(input.whatsapp.sendVideoOnce).not.toHaveBeenCalled();
-  expect(input.store.getRelaySource(message.groupId, message.id)).toMatchObject({ status: 'held', cleanup: 'retained' });
+  const saved = input.store.getRelaySource(message.groupId, message.id)!;
+  expect(saved).toMatchObject({ status: 'held' });
+  expect(saved.version).toBe(2);
+  if (saved.version === 2) {
+    expect(saved.cleanup.initial).toBe('mixed-content');
+    expect(saved.cleanup.disqualifications).toEqual(mode === 'changed' || mode === 'wrong-group' || mode === 'wrong-sender'
+      ? ['source-edited'] : []);
+  }
 });
 
 it('pauses disabled work and resumes on re-enable under current settings without resetting its acceptance time', async () => {

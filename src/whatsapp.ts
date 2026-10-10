@@ -7,9 +7,10 @@ import { executeTargetedRetry, handleIncomingMessage, recoverRelaySources, obser
 import { RelayLifecycle } from './relayLifecycle.js';
 import type { AppConfig } from './config.js';
 import type { RepostConfirmation, RepostEvidence, Store } from './store.js';
-import { prepareRetryWork, RetryPreviewRegistry, RetryValidationError, retryLinkPlanMatches, sameRetrySource } from './targetedRetry.js';
-import { UnsupportedRelayStateError } from './relayState.js';
+import { prepareRetryWork, RetryPreviewRegistry, RetryValidationError, checkRetryLinkPlan, sameRetrySource } from './targetedRetry.js';
+import { addCleanupDisqualification, UnsupportedRelayStateError, type CleanupDisqualification } from './relayState.js';
 import { prepareWhatsappRuntime, resolveWhatsappRuntimePaths, type WhatsappRuntimePathInput } from './whatsappRuntime.js';
+import type { CleanupCheckResult, CleanupDeleteResult, CleanupSourceIdentity } from './sourceCleanup.js';
 
 const { Client, LocalAuth, MessageMedia } = whatsappWeb;
 
@@ -26,6 +27,8 @@ export type WhatsappRelay = {
   getSourceMessage(groupId: string, messageId: string): Promise<IncomingMessage | null>;
   lookupRepost(groupId: string, messageId: string): Promise<RepostConfirmation | null>;
   deleteMessage(groupId: string, messageId: string): Promise<void>;
+  checkSourceForCleanup(source: CleanupSourceIdentity): Promise<CleanupCheckResult>;
+  deleteSourceForCleanup(source: CleanupSourceIdentity, canInvoke: () => boolean): Promise<CleanupDeleteResult>;
   sendText(groupId: string, text: string): Promise<void>;
 };
 
@@ -55,6 +58,7 @@ type WhatsappMessage = {
   fromMe?: boolean;
   hasQuotedMsg?: boolean;
   getQuotedMessage?(): Promise<WhatsappMessage>;
+  delete?(everyone: boolean): Promise<unknown>;
   reply(text: string): Promise<unknown> | unknown;
   getChat(): Promise<WhatsappChat>;
   getContact?(): Promise<WhatsappContact>;
@@ -197,6 +201,22 @@ export function createWhatsappBot({ config, store, downloader, queue, runtimePat
     async deleteMessage(_groupId, messageIdValue) {
       const message = await client.getMessageById(messageIdValue);
       await message.delete(true);
+    },
+
+    async checkSourceForCleanup(source): Promise<CleanupCheckResult> {
+      const target = await cleanupTarget(client, control, source);
+      return target.status;
+    },
+
+    async deleteSourceForCleanup(source, canInvoke): Promise<CleanupDeleteResult> {
+      const target = await cleanupTarget(client, control, source);
+      if (target.status !== 'ready') return target.status;
+      let allowed: boolean;
+      try { allowed = canInvoke(); }
+      catch { return 'blocked'; }
+      if (!target.message.delete || !allowed || !control.canSubmit() || !control.canPersist() || !client.info) return 'blocked';
+      await target.message.delete(true);
+      return 'returned';
     },
 
     async sendText(groupId, text) {
@@ -401,6 +421,8 @@ async function handleWhatsappMessage(
       sendVideoOnce: relayWhatsapp.sendVideoOnce,
       sendText: relayWhatsapp.sendText,
       deleteMessage: relayWhatsapp.deleteMessage,
+      checkSourceForCleanup: relayWhatsapp.checkSourceForCleanup,
+      deleteSourceForCleanup: relayWhatsapp.deleteSourceForCleanup,
     },
     downloader,
     timezone: config.timezone,
@@ -488,7 +510,7 @@ async function issueRetryPreview(input: TargetedRetryCommandInput, requesterId: 
       const liveSource = await relayWhatsapp.getSourceMessage(groupId, source.messageId).catch(() => null);
       if (!liveSourceMatches(source, liveSource)) {
         retryPreviews.invalidateSource(groupId, source.messageId);
-        holdRetrySource(store, source, input.logger);
+        holdRetrySource(store, source, input.logger, liveSource ? 'source-edited' : undefined);
         await message.reply('Source is missing, changed, or unavailable. Work remains held; no retry was admitted.');
         return;
       }
@@ -504,7 +526,7 @@ async function issueRetryPreview(input: TargetedRetryCommandInput, requesterId: 
             const checkedLiveSource = await relayWhatsapp.getSourceMessage(groupId, source.messageId).catch(() => null);
             if (!liveSourceMatches(latest, checkedLiveSource)) {
               retryPreviews.invalidateSource(groupId, source.messageId);
-              holdRetrySource(store, latest, input.logger);
+              holdRetrySource(store, latest, input.logger, checkedLiveSource ? 'source-edited' : undefined);
               await message.reply('Source is missing, changed, or unavailable. Work remains held; no retry was admitted.');
               return;
             }
@@ -518,7 +540,9 @@ async function issueRetryPreview(input: TargetedRetryCommandInput, requesterId: 
       } catch (error) {
         if (!(error instanceof RetryValidationError) && !(error instanceof UnsupportedRelayStateError)) throw error;
         retryPreviews.invalidateSource(groupId, source.messageId);
-        if (error instanceof RetryValidationError && ['source-unavailable', 'source-changed'].includes(error.reason)) holdRetrySource(store, source, input.logger);
+        if (error instanceof RetryValidationError && ['source-unavailable', 'source-changed'].includes(error.reason)) {
+          holdRetrySource(store, source, input.logger, error.reason === 'source-changed' ? 'media-plan-changed' : undefined);
+        }
         await message.reply('The previous retry preview is no longer valid. No retry was admitted; request a fresh preview.');
         return;
       }
@@ -538,7 +562,7 @@ async function issueRetryPreview(input: TargetedRetryCommandInput, requesterId: 
   const settingsRevision = store.getGroupSettingsRevision(groupId);
   const liveSource = await relayWhatsapp.getSourceMessage(groupId, source.messageId).catch(() => null);
   if (!liveSourceMatches(source, liveSource)) {
-    holdRetrySource(store, source, input.logger);
+    holdRetrySource(store, source, input.logger, liveSource ? 'source-edited' : undefined);
     await message.reply('Source is missing, changed, or unavailable. Work remains held; no retry was admitted.');
     return;
   }
@@ -547,7 +571,9 @@ async function issueRetryPreview(input: TargetedRetryCommandInput, requesterId: 
   try { preparation = await prepareRetryWork(source, store, downloader, settings, Date.now()); }
   catch (error) {
     if (!(error instanceof RetryValidationError) && !(error instanceof UnsupportedRelayStateError)) throw error;
-    if (error instanceof RetryValidationError && ['source-unavailable', 'source-changed'].includes(error.reason)) holdRetrySource(store, source, input.logger);
+    if (error instanceof RetryValidationError && ['source-unavailable', 'source-changed'].includes(error.reason)) {
+      holdRetrySource(store, source, input.logger, error.reason === 'source-changed' ? 'media-plan-changed' : undefined);
+    }
     await message.reply(error instanceof RetryValidationError && error.reason === 'not-eligible'
       ? 'No definitely pre-send work currently qualifies. Confirmed, skipped, and delivery-unknown work stay protected.'
       : 'Retry preview could not validate the saved source and plan. Work remains held; no retry was admitted.');
@@ -566,7 +592,7 @@ async function issueRetryPreview(input: TargetedRetryCommandInput, requesterId: 
   }
   const checkedLiveSource = await relayWhatsapp.getSourceMessage(groupId, source.messageId).catch(() => null);
   if (!liveSourceMatches(source, checkedLiveSource)) {
-    holdRetrySource(store, source, input.logger);
+    holdRetrySource(store, source, input.logger, checkedLiveSource ? 'source-edited' : undefined);
     await message.reply('Source is missing, changed, or unavailable. Work remains held; no retry was admitted.');
     return;
   }
@@ -642,7 +668,7 @@ async function admitAndRunRetry(input: TargetedRetryCommandInput, requesterId: s
   }
   let liveSource = await relayWhatsapp.getSourceMessage(groupId, preview.messageId).catch(() => null);
   if (!liveSourceMatches(sourceBefore, liveSource)) {
-    holdRetrySource(store, sourceBefore, input.logger);
+    holdRetrySource(store, sourceBefore, input.logger, liveSource ? 'source-edited' : undefined);
     await reject('Source is missing, changed, or unavailable. Work remains held; no retry was admitted.');
     return;
   }
@@ -650,7 +676,9 @@ async function admitAndRunRetry(input: TargetedRetryCommandInput, requesterId: s
   try { preparation = await prepareRetryWork(sourceBefore, store, downloader, currentSettings, Date.now()); }
   catch (error) {
     if (!(error instanceof RetryValidationError) && !(error instanceof UnsupportedRelayStateError)) throw error;
-    if (error instanceof RetryValidationError && ['source-unavailable', 'source-changed'].includes(error.reason)) holdRetrySource(store, sourceBefore, input.logger);
+    if (error instanceof RetryValidationError && ['source-unavailable', 'source-changed'].includes(error.reason)) {
+      holdRetrySource(store, sourceBefore, input.logger, error.reason === 'source-changed' ? 'media-plan-changed' : undefined);
+    }
     await reject(error instanceof RetryValidationError && error.reason === 'not-eligible'
       ? 'The previewed eligible work changed. Nothing was retried; request a fresh preview.'
       : 'The source or saved plan could not be revalidated. Work remains held; request a fresh preview.');
@@ -663,7 +691,7 @@ async function admitAndRunRetry(input: TargetedRetryCommandInput, requesterId: s
   }
   liveSource = await relayWhatsapp.getSourceMessage(groupId, preview.messageId).catch(() => null);
   if (!liveSourceMatches(sourceBefore, liveSource)) {
-    holdRetrySource(store, sourceBefore, input.logger);
+    holdRetrySource(store, sourceBefore, input.logger, liveSource ? 'source-edited' : undefined);
     await reject('Source is missing, changed, or unavailable. Work remains held; no retry was admitted.');
     return;
   }
@@ -715,11 +743,17 @@ async function admitAndRunRetry(input: TargetedRetryCommandInput, requesterId: s
     settingsRevision: preview.settingsRevision,
     requesterStillAuthorized: () => requesterStillAuthorized(input, requesterId),
     sourceAndPlanStillMatch: async (savedSource: import('./relayState.js').RelaySource, link: import('./relayState.js').RelayLink) => {
-      if (!await retryLinkPlanMatches(link, downloader)) return false;
+      const planCheck = await checkRetryLinkPlan(link, downloader);
+      if (planCheck !== 'matching') {
+        holdRetrySource(store, savedSource, input.logger, planCheck === 'changed' ? 'media-plan-changed' : undefined);
+        return false;
+      }
       const persisted = store.getRelaySource(groupId, preview.messageId);
       if (!persisted || !sameRetrySource(persisted, savedSource)) return false;
       const current = await relayWhatsapp.getSourceMessage(groupId, preview.messageId).catch(() => null);
-      return liveSourceMatches(savedSource, current);
+      if (liveSourceMatches(savedSource, current)) return true;
+      holdRetrySource(store, savedSource, input.logger, current ? 'source-edited' : undefined);
+      return false;
     },
   };
   try {
@@ -756,10 +790,45 @@ function liveSourceMatches(source: NonNullable<ReturnType<Store['getRelaySource'
     && live.senderId === source.senderId && relayContentHash(live.body) === source.contentHash);
 }
 
-function holdRetrySource(store: Store, expected: NonNullable<ReturnType<Store['getRelaySource']>>, logger?: (entry: Record<string, unknown>) => void): void {
+type CleanupTargetResult = { status: Exclude<CleanupCheckResult, 'ready'> } | { status: 'ready'; message: WhatsappMessage };
+
+async function cleanupTarget(
+  client: InstanceType<typeof Client>,
+  control: RelayLifecycle,
+  source: CleanupSourceIdentity,
+): Promise<CleanupTargetResult> {
+  if (!control.canSubmit() || !client.info) return { status: 'client-unavailable' };
+  let message: WhatsappMessage | null;
+  try { message = await client.getMessageById(source.messageId) as WhatsappMessage | null; }
+  catch { return { status: 'unavailable' }; }
+  if (!message) return { status: 'missing' };
+  if (messageId(message) !== source.messageId || message.fromMe || message.from !== source.groupId) return { status: 'mismatch' };
+
+  let chat: WhatsappChat;
+  try { chat = await message.getChat(); }
+  catch { return { status: 'unavailable' }; }
+  if (!chat.isGroup || serializedId(chat.id) !== source.groupId) return { status: 'mismatch' };
+  const current = toIncomingMessage(message, chat, source.groupId);
+  if (current.senderId !== source.senderId || relayContentHash(current.body) !== source.contentHash) return { status: 'mismatch' };
+  if (!message.delete) return { status: 'authority-unavailable' };
+
+  const botId = currentBotId(client);
+  if (!botId || !participantIsAdmin(chat.participants, botId)) return { status: 'authority-unavailable' };
+  if (!control.canSubmit() || !client.info) return { status: 'client-unavailable' };
+  return { status: 'ready', message };
+}
+
+function holdRetrySource(store: Store, expected: NonNullable<ReturnType<Store['getRelaySource']>>, logger?: (entry: Record<string, unknown>) => void, disqualification?: CleanupDisqualification): void {
   try {
     const source = store.getRelaySource(expected.groupId, expected.messageId);
-    if (!source || !sameRetrySource(source, expected) || (source.status === 'held' && source.holdReason === 'source-unavailable-or-changed')) return;
+    if (!source || source.contentHash !== expected.contentHash || source.senderId !== expected.senderId) return;
+    const snapshotMatches = sameRetrySource(source, expected);
+    const cleanupChanged = disqualification ? addCleanupDisqualification(source, disqualification) : false;
+    if (!snapshotMatches) {
+      if (cleanupChanged) store.saveRelaySource(source);
+      return;
+    }
+    if (!cleanupChanged && source.status === 'held' && source.holdReason === 'source-unavailable-or-changed') return;
     source.status = 'held';
     source.holdReason = 'source-unavailable-or-changed';
     store.saveRelaySource(source);

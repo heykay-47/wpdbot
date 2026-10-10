@@ -3,7 +3,7 @@ import { dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import Database from 'better-sqlite3';
 import { mediaIdentityKey, type MediaIdentity } from './mediaIdentity.js';
-import { serializeRelaySource, UnsupportedRelayStateError, validateRelaySource, type RelaySource } from './relayState.js';
+import { serializeRelaySource, UnsupportedRelayStateError, validateRelaySource, type CleanupOutcome, type RelaySource } from './relayState.js';
 
 export type GroupSettings = {
   groupId: string;
@@ -27,7 +27,7 @@ export type InstagramItemProgress = { status: 'sending' | 'confirmed'; sentMessa
 
 export type MediaRepostKey = { groupId: string; messageId: string; identity: MediaIdentity };
 export type MediaDisposition = 'ready' | 'completed' | 'duplicate' | 'held';
-export type MediaAttempt = { status: 'sending' | 'confirmed'; sentMessageId: string | null; ack: number | null; sourceUrl: string };
+export type MediaAttempt = { status: 'sending' | 'confirmed'; sentMessageId: string | null; ack: number | null; sourceUrl: string; deliveryMode: 'video' | 'document' | null; confirmedAtMs: number | null };
 
 export type StoreDefaults = {
   maxFileSizeMb?: number;
@@ -57,6 +57,8 @@ export type Store = {
   acceptRelaySource(source: RelaySource): void;
   getRelaySource(groupId: string, messageId: string): RelaySource | null;
   saveRelaySource(source: RelaySource): void;
+  beginRelaySourceCleanup(source: RelaySource): boolean;
+  recordRelaySourceCleanupOutcome(groupId: string, messageId: string, outcome: Exclude<CleanupOutcome, 'not-attempted' | 'unknown'>, claimNotice: boolean): boolean;
   listRelaySources(): RelaySource[];
   getGroupSettings(groupId: string): GroupSettings;
   getGroupSettingsRevision(groupId: string): number;
@@ -80,7 +82,7 @@ export type Store = {
   beginInstagramItem(key: InstagramItemKey, nowMs: number): boolean;
   confirmInstagramItem(key: InstagramItemKey, confirmation: RepostConfirmation, record: RepostRecord): void;
   getMediaDisposition(key: MediaRepostKey, nowMs: number, windowHours: number): MediaDisposition;
-  beginMediaRepost(key: MediaRepostKey, record: RepostRecord, windowHours: number, guard?: RetryReservationGuard): 'started' | Exclude<MediaDisposition, 'ready'>;
+  beginMediaRepost(key: MediaRepostKey, record: RepostRecord, windowHours: number, guard?: RetryReservationGuard, deliveryMode?: 'video' | 'document'): 'started' | Exclude<MediaDisposition, 'ready'>;
   confirmMediaRepost(key: MediaRepostKey, confirmation: RepostConfirmation, record: RepostRecord): void;
   getMediaAttempt(key: MediaRepostKey): MediaAttempt | null;
   recordMediaEvidence(key: MediaRepostKey, evidence: RepostEvidence): void;
@@ -195,6 +197,7 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
       confirmed_at_ms INTEGER,
       sent_message_id TEXT,
       ack INTEGER,
+      delivery_mode TEXT CHECK (delivery_mode IS NULL OR delivery_mode IN ('video', 'document')),
       PRIMARY KEY (group_id, message_id, media_key)
     );
     CREATE UNIQUE INDEX IF NOT EXISTS media_relay_pending
@@ -232,6 +235,11 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
   const settingsColumns = db.prepare<[], { name: string }>('PRAGMA table_info(group_settings)').all();
   if (!settingsColumns.some((column) => column.name === 'settings_revision')) {
     db.exec('ALTER TABLE group_settings ADD COLUMN settings_revision INTEGER NOT NULL DEFAULT 0');
+  }
+
+  const mediaAttemptColumns = db.prepare<[], { name: string }>('PRAGMA table_info(media_relay_attempts)').all();
+  if (!mediaAttemptColumns.some((column) => column.name === 'delivery_mode')) {
+    db.exec('ALTER TABLE media_relay_attempts ADD COLUMN delivery_mode TEXT');
   }
 
   const insertRelaySource = db.prepare('INSERT OR IGNORE INTO relay_sources (group_id, message_id, state_json) VALUES (?, ?, ?)');
@@ -280,6 +288,34 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
     if (existing) { readSource(existing.state, source.groupId, source.messageId); return; }
     insertRelaySource.run(source.groupId, source.messageId, serializeRelaySource(source));
     ensureReference(source.groupId, source.messageId);
+  });
+  const beginRelayCleanup = db.transaction((expected: RelaySource): boolean => {
+    validateRelaySource(expected);
+    if (expected.version !== 2 || expected.cleanup.initial !== 'link-only' || expected.cleanup.disqualifications.length
+      || expected.cleanup.intentRecorded || expected.cleanup.outcome !== 'not-attempted') return false;
+    const row = selectRelaySource.get(expected.groupId, expected.messageId);
+    if (!row) return false;
+    const current = readSource(row.state, expected.groupId, expected.messageId);
+    if (current.version !== 2 || serializeRelaySource(current) !== serializeRelaySource(expected)
+      || current.cleanup.intentRecorded || current.cleanup.initial !== 'link-only' || current.cleanup.disqualifications.length) return false;
+    current.cleanup.intentRecorded = true;
+    current.cleanup.outcome = 'unknown';
+    delete current.cleanup.deferredReason;
+    updateRelaySource.run(serializeRelaySource(current), current.groupId, current.messageId);
+    return true;
+  });
+  const recordCleanupOutcome = db.transaction((groupId: string, messageId: string,
+    outcome: Exclude<CleanupOutcome, 'not-attempted' | 'unknown'>, claimNotice: boolean): boolean => {
+    if (claimNotice && outcome === 'returned-unverified') throw new Error('Successful cleanup cannot claim a failure notice');
+    const row = selectRelaySource.get(groupId, messageId);
+    if (!row) return false;
+    const source = readSource(row.state, groupId, messageId);
+    if (source.version !== 2 || !source.cleanup.intentRecorded || source.cleanup.outcome !== 'unknown') return false;
+    source.cleanup.outcome = outcome;
+    source.cleanup.noticeClaimed = claimNotice;
+    validateRelaySource(source);
+    updateRelaySource.run(serializeRelaySource(source), groupId, messageId);
+    return true;
   });
 
   const insertDefaultSettings = db.prepare(`
@@ -372,14 +408,15 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
     SELECT message_id FROM media_relay_attempts WHERE group_id = ? AND media_key = ? AND status = 'sending'
   `);
   const insertMediaAttempt = db.prepare(`
-    INSERT INTO media_relay_attempts (group_id, message_id, media_key, source_url, status, started_at_ms)
-    VALUES (?, ?, ?, ?, 'sending', ?)
+    INSERT INTO media_relay_attempts (group_id, message_id, media_key, source_url, status, started_at_ms, delivery_mode)
+    VALUES (?, ?, ?, ?, 'sending', ?, ?)
   `);
   const selectSourceMedia = db.prepare<[string, string, string], { status: 'sending' | 'confirmed' }>(`
     SELECT status FROM media_relay_attempts WHERE group_id = ? AND message_id = ? AND media_key = ?
   `);
   const selectMediaAttempt = db.prepare<[string, string, string], MediaAttempt>(`
-    SELECT status, sent_message_id AS sentMessageId, ack, source_url AS sourceUrl FROM media_relay_attempts
+    SELECT status, sent_message_id AS sentMessageId, ack, source_url AS sourceUrl, delivery_mode AS deliveryMode,
+      confirmed_at_ms AS confirmedAtMs FROM media_relay_attempts
     WHERE group_id = ? AND message_id = ? AND media_key = ?
   `);
   const updateMediaEvidence = db.prepare(`
@@ -528,7 +565,7 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
     updateRelaySource.run(serializeRelaySource(sourceAfter), groupId, messageId);
     return 'admitted';
   });
-  const beginMediaRepost = db.transaction((key: MediaRepostKey, record: RepostRecord, windowHours: number, guard?: RetryReservationGuard): ReturnType<Store['beginMediaRepost']> => {
+  const beginMediaRepost = db.transaction((key: MediaRepostKey, record: RepostRecord, windowHours: number, guard?: RetryReservationGuard, deliveryMode?: 'video' | 'document'): ReturnType<Store['beginMediaRepost']> => {
     if (record.groupId !== key.groupId || !key.groupId.trim() || !key.messageId.trim()) throw new Error('Media send requires matching group and source identities');
     if (!Number.isSafeInteger(record.createdAtMs)) throw new Error('Media send timestamp is invalid');
     if (guard) {
@@ -537,7 +574,7 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
     } else if (selectActiveRetryPass.get(key.groupId, key.messageId)) return 'held';
     const disposition = getMediaDisposition(key, record.createdAtMs, windowHours);
     if (disposition !== 'ready') return disposition;
-    insertMediaAttempt.run(key.groupId, key.messageId, mediaIdentityKey(key.identity), record.url, record.createdAtMs);
+    insertMediaAttempt.run(key.groupId, key.messageId, mediaIdentityKey(key.identity), record.url, record.createdAtMs, deliveryMode ?? null);
     return 'started';
   });
   const confirmMediaRepost = db.transaction((key: MediaRepostKey, confirmation: RepostConfirmation, record: RepostRecord) => {
@@ -550,6 +587,36 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
     if (!changed.changes) throw new Error('Media send reservation is missing or already confirmed');
     insertRepost.run(record.groupId, record.senderId, record.url, record.urlHash, record.createdAtMs);
   });
+  const mergeCleanupProgress = (current: RelaySource, incoming: RelaySource): RelaySource => {
+    if (current.version !== incoming.version) throw new UnsupportedRelayStateError('Durable source version cannot be changed');
+    if (current.version === 1 || incoming.version === 1) return incoming;
+    if (current.cleanup.version !== incoming.cleanup.version || current.cleanup.initial !== incoming.cleanup.initial
+      || current.cleanup.initialFingerprint !== incoming.cleanup.initialFingerprint) {
+      throw new UnsupportedRelayStateError('Initial cleanup evidence cannot be changed');
+    }
+    const outcomeRank: Record<CleanupOutcome, number> = {
+      'not-attempted': 0, unknown: 1, 'not-invoked': 2, threw: 2, 'returned-unverified': 2,
+    };
+    if ((!current.cleanup.intentRecorded && incoming.cleanup.intentRecorded)
+      || outcomeRank[incoming.cleanup.outcome] > outcomeRank[current.cleanup.outcome]
+      || (outcomeRank[current.cleanup.outcome] === 2 && incoming.cleanup.outcome !== current.cleanup.outcome)
+      || (!current.cleanup.noticeClaimed && incoming.cleanup.noticeClaimed)) {
+      throw new UnsupportedRelayStateError('Cleanup progress must use its atomic store operation');
+    }
+    const currentOutcomeIsFinal = current.cleanup.outcome !== 'not-attempted' && current.cleanup.outcome !== 'unknown';
+    return {
+      ...incoming,
+      cleanup: {
+        ...incoming.cleanup,
+        disqualifications: [...new Set([...current.cleanup.disqualifications, ...incoming.cleanup.disqualifications])],
+        intentRecorded: current.cleanup.intentRecorded || incoming.cleanup.intentRecorded,
+        outcome: currentOutcomeIsFinal ? current.cleanup.outcome
+          : current.cleanup.outcome === 'unknown' && incoming.cleanup.outcome === 'not-attempted' ? 'unknown' : incoming.cleanup.outcome,
+        noticeClaimed: current.cleanup.noticeClaimed || incoming.cleanup.noticeClaimed,
+        deferredReason: current.cleanup.intentRecorded ? undefined : incoming.cleanup.deferredReason ?? current.cleanup.deferredReason,
+      },
+    };
+  };
 
   // Explicit retry permission never survives process restart. Preserve any crossed send intents while revoking unsubmitted work.
   try { revokeActivePasses(); }
@@ -568,9 +635,20 @@ export function createStore(path: string, defaults: StoreDefaults = {}): Store {
 
     saveRelaySource(source) {
       validateRelaySource(source);
-      if (!updateRelaySource.run(serializeRelaySource(source), source.groupId, source.messageId).changes) {
-        throw new Error('Durable source is missing');
-      }
+      const row = selectRelaySource.get(source.groupId, source.messageId);
+      if (!row) throw new Error('Durable source is missing');
+      const current = readSource(row.state, source.groupId, source.messageId);
+      const merged = mergeCleanupProgress(current, source);
+      validateRelaySource(merged);
+      updateRelaySource.run(serializeRelaySource(merged), source.groupId, source.messageId);
+    },
+
+    beginRelaySourceCleanup(source) {
+      return beginRelayCleanup.immediate(source);
+    },
+
+    recordRelaySourceCleanupOutcome(groupId, messageId, outcome, claimNotice) {
+      return recordCleanupOutcome.immediate(groupId, messageId, outcome, claimNotice);
     },
 
     listRelaySources() {

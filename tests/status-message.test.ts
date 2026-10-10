@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { createStore, type Store } from '../src/store';
-import { handleIncomingMessage, relayContentHash } from '../src/relay';
+import { handleIncomingMessage, recoverRelaySources, relayContentHash } from '../src/relay';
 import type { RelaySource } from '../src/relayState';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
@@ -426,6 +426,72 @@ describe('createWhatsappBot', () => {
     expect(clients[0].sendMessage).not.toHaveBeenCalled();
   });
 
+  test.each(['edited', 'edited-after-missing', 'edited-concurrent-progress', 'missing'] as const)('preserves cleanup evidence after a retry observes a %s source', async (observation) => {
+    const fixture = await retryCommandFixture(2);
+    const source = fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)!;
+    const key = { groupId: fixture.groupId, messageId: fixture.sourceId, identity: source.links[0].plan!.items[0].identity! };
+    const record = { groupId: fixture.groupId, senderId: source.senderId, url: source.links[0].url,
+      urlHash: source.links[0].urlHash, createdAtMs: Date.now() };
+    fixture.store.beginMediaRepost(key, record, 24, undefined, 'video');
+    fixture.store.confirmMediaRepost(key, { messageId: 'confirmed-before-edit', ack: 1 }, record);
+    source.links[0].status = 'ready';
+    source.links[0].plan!.items[0].status = 'confirmed';
+    fixture.store.saveRelaySource(source);
+    if (observation === 'edited-after-missing') {
+      clients[0].getMessageById.mockResolvedValueOnce(null);
+      await clients[0].handlers.get('message')?.(fixture.command('!bot retry', 'missing-request'));
+    }
+    clients[0].getMessageById.mockImplementationOnce(async () => {
+      if (observation === 'edited-concurrent-progress') {
+        const current = fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)!;
+        current.status = 'paused';
+        fixture.store.saveRelaySource(current);
+      }
+      return observation === 'missing' ? null : fakeMessage(`${fixture.sourceMessage.body} edited`, { id: fixture.sourceId });
+    });
+    await clients[0].handlers.get('message')?.(fixture.command('!bot retry', 'observation-request'));
+    const observed = fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)!;
+    expect(observed.cleanup).toMatchObject({ disqualifications: observation === 'missing' ? [] : ['source-edited'], intentRecorded: false });
+
+    const restored = Object.assign(fixture.sourceMessage, { delete: vi.fn(async () => undefined) });
+    clients[0].getMessageById.mockResolvedValue(restored);
+    await recoverRelaySources({ store: fixture.store, whatsapp: fixture.bot.relayWhatsapp,
+      downloader: fixture.downloader, timezone: 'UTC' });
+    expect(restored.delete).toHaveBeenCalledTimes(observation === 'missing' ? 1 : 0);
+    expect(clients[0].sendMessage).not.toHaveBeenCalled();
+  });
+
+  test.each(['repeated-preview', 'admission', 'post-plan', 'active-retry'] as const)('permanently disqualifies edits observed during %s validation', async (stage) => {
+    const fixture = await retryCommandFixture(2);
+    await fixture.request();
+    const edited = fakeMessage(`${fixture.sourceMessage.body} edited`, { id: fixture.sourceId });
+    if (stage === 'post-plan') clients[0].getMessageById.mockResolvedValueOnce(fixture.sourceMessage);
+    if (stage === 'active-retry') clients[0].getMessageById.mockResolvedValueOnce(fixture.sourceMessage)
+      .mockResolvedValueOnce(fixture.sourceMessage);
+    clients[0].getMessageById.mockResolvedValue(edited);
+    await clients[0].handlers.get('message')?.(fixture.command(stage === 'repeated-preview' ? '!bot retry' : '!bot retry confirm', 'validation', 1));
+    expect(fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)?.cleanup).toMatchObject({
+      intentRecorded: false, disqualifications: ['source-edited'],
+    });
+    expect(clients[0].sendMessage).not.toHaveBeenCalled();
+  });
+
+  test.each(['changed', 'unavailable'] as const)('distinguishes a %s media plan during active retry cleanup validation', async (observation) => {
+    const fixture = await retryCommandFixture(2);
+    await fixture.request();
+    const resolve = fixture.downloader.resolveYouTube.getMockImplementation()!;
+    fixture.downloader.resolveYouTube.mockImplementationOnce(resolve).mockImplementationOnce(resolve);
+    if (observation === 'changed') fixture.downloader.resolveYouTube.mockImplementationOnce(async (url) => ({
+      ...await resolve(url), id: 'Different12',
+    }));
+    else fixture.downloader.resolveYouTube.mockRejectedValueOnce(new Error('private unavailable metadata'));
+    await clients[0].handlers.get('message')?.(fixture.command('!bot retry confirm', 'validation', 1));
+    expect(fixture.store.getRelaySource(fixture.groupId, fixture.sourceId)?.cleanup).toMatchObject({
+      intentRecorded: false, disqualifications: observation === 'changed' ? ['media-plan-changed'] : [],
+    });
+    expect(mediaPaths).toHaveLength(0);
+  });
+
   test('records an in-flight retry confirmation without reviving other work after group disable', async () => {
     const store = createStore(':memory:');
     stores.push(store);
@@ -785,7 +851,7 @@ describe('createWhatsappBot', () => {
     const thirdStore = createStore(path);
     stores.push(thirdStore);
     expect(thirdStore.getRelaySource(groupId, sourceId)).toMatchObject({ workReference: before.workReference,
-      acceptedAtMs: before.acceptedAtMs, cleanup: 'retained',
+      acceptedAtMs: before.acceptedAtMs, cleanup: { initial: 'link-only', intentRecorded: false, outcome: 'not-attempted' },
       links: [{ plan: { items: [{ status: 'confirmed' }] } }, { plan: { items: [{ status: 'confirmed' }] } }, { plan: { items: [{ status: 'confirmed' }] } }] });
     expect(thirdStore.countReposts()).toBe(3);
   });
@@ -939,6 +1005,71 @@ describe('createWhatsappBot', () => {
     expect(clients[0].sendMessage).toHaveBeenCalledWith('group-1@g.us', 'hello');
     expect(clients[0].getMessageById).toHaveBeenCalledWith('message-1');
     expect(deletedMessages[0].delete).toHaveBeenCalledWith(true);
+  });
+
+  test('ordinary incoming inline relaying invokes guarded cleanup without waiting for restart', async () => {
+    const store = createStore(':memory:');
+    stores.push(store);
+    store.setGroupEnabled('group-1@g.us', true);
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    createWhatsappBot({ config: baseConfig(), store, downloader: fakeDownloader() });
+    const sourceMessage = Object.assign(fakeMessage('https://youtube.com/shorts/AbCdEf123_-', {
+      timestamp: Math.floor(Date.now() / 1000),
+    }), { delete: vi.fn(async () => undefined) });
+    clients[0].getMessageById.mockResolvedValue(sourceMessage);
+    clients[0].sendMessage.mockResolvedValue({ id: { _serialized: 'inline-repost' }, ack: 1, fromMe: true, to: 'group-1@g.us' });
+    await deliver(sourceMessage);
+    expect(sourceMessage.delete).toHaveBeenCalledExactlyOnceWith(true);
+    expect(store.getRelaySource('group-1@g.us', 'message-1')?.cleanup).toMatchObject({
+      intentRecorded: true, outcome: 'returned-unverified',
+    });
+  });
+
+  test('guarded cleanup re-fetches the exact unchanged source and checks the final invoke guard', async () => {
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
+    const body = 'https://youtube.com/shorts/AbCdEf123_-';
+    const message = Object.assign(fakeMessage(body), { delete: vi.fn(async () => undefined) });
+    const source = { groupId: 'group-1@g.us', messageId: 'message-1', senderId: 'admin@c.us', contentHash: relayContentHash(body) };
+    await clients[0].handlers.get('ready')?.();
+    clients[0].getMessageById.mockResolvedValueOnce(message).mockResolvedValueOnce(message);
+
+    await expect(bot.relayWhatsapp.checkSourceForCleanup(source)).resolves.toBe('ready');
+    const canInvoke = vi.fn(() => true);
+    await expect(bot.relayWhatsapp.deleteSourceForCleanup(source, canInvoke)).resolves.toBe('returned');
+
+    expect(clients[0].getMessageById).toHaveBeenNthCalledWith(1, 'message-1');
+    expect(clients[0].getMessageById).toHaveBeenNthCalledWith(2, 'message-1');
+    expect(canInvoke).toHaveBeenCalledOnce();
+    expect(message.delete).toHaveBeenCalledWith(true);
+  });
+
+  test('guarded cleanup blocks identity mismatch and missing delete authority before invoking', async () => {
+    const { createWhatsappBot } = await import('../src/whatsapp');
+    const bot = createWhatsappBot({ config: baseConfig(), store: fakeStore(), downloader: fakeDownloader() });
+    const body = 'https://youtube.com/shorts/AbCdEf123_-';
+    const source = { groupId: 'group-1@g.us', messageId: 'message-1', senderId: 'admin@c.us', contentHash: relayContentHash(body) };
+    await clients[0].handlers.get('ready')?.();
+    const original = Object.assign(fakeMessage(body), { delete: vi.fn() });
+    const changedAfterIntent = Object.assign(fakeMessage(`${body} edited`), { delete: vi.fn() });
+    clients[0].getMessageById.mockResolvedValueOnce(original).mockResolvedValueOnce(changedAfterIntent);
+    await expect(bot.relayWhatsapp.checkSourceForCleanup(source)).resolves.toBe('ready');
+    const finalGuard = vi.fn(() => true);
+    await expect(bot.relayWhatsapp.deleteSourceForCleanup(source, finalGuard)).resolves.toBe('mismatch');
+    expect(finalGuard).not.toHaveBeenCalled();
+    expect(changedAfterIntent.delete).not.toHaveBeenCalled();
+
+    const changed = fakeMessage(`${body} edited`);
+    clients[0].getMessageById.mockResolvedValueOnce(changed);
+    await expect(bot.relayWhatsapp.checkSourceForCleanup(source)).resolves.toBe('mismatch');
+
+    const noDeleteMethod = fakeMessage(body);
+    clients[0].getMessageById.mockResolvedValueOnce(noDeleteMethod);
+    await expect(bot.relayWhatsapp.checkSourceForCleanup(source)).resolves.toBe('authority-unavailable');
+
+    const nonAdmin = Object.assign(fakeMessage(body, { botIsAdmin: false }), { delete: vi.fn() });
+    clients[0].getMessageById.mockResolvedValueOnce(nonAdmin);
+    await expect(bot.relayWhatsapp.checkSourceForCleanup(source)).resolves.toBe('authority-unavailable');
   });
 
   test('Instagram sends require observed server acknowledgement and never retry an ambiguous send', async () => {
@@ -1124,7 +1255,7 @@ function baseConfig() {
   };
 }
 
-async function retryCommandFixture() {
+async function retryCommandFixture(version: 1 | 2 = 1) {
   const store = createStore(':memory:');
   stores.push(store);
   const groupId = 'group-1@g.us';
@@ -1132,8 +1263,11 @@ async function retryCommandFixture() {
   const body = 'https://youtube.com/shorts/AbCdEf123_-';
   const now = Date.now();
   store.setGroupEnabled(groupId, true);
-  store.acceptRelaySource({ version: 1, groupId, messageId: sourceId, senderId: 'admin@c.us', senderName: 'Admin',
-    timestampMs: now, acceptedAtMs: now, contentHash: relayContentHash(body), status: 'settled', cleanup: 'retained',
+  store.acceptRelaySource({ ...(version === 1 ? { version: 1, cleanup: 'retained' } as const : {
+    version: 2, cleanup: { version: 1, initial: 'link-only', initialFingerprint: relayContentHash(body),
+      disqualifications: [], intentRecorded: false, outcome: 'not-attempted', noticeClaimed: false },
+  } as const), groupId, messageId: sourceId, senderId: 'admin@c.us', senderName: 'Admin',
+    timestampMs: now, acceptedAtMs: now, contentHash: relayContentHash(body), status: 'settled',
     links: [{ url: body, platform: 'youtube', urlHash: 'retry-hash', status: 'failed', plan: { parentId: 'AbCdEf123_-', totalItems: 1,
       items: [{ index: 1, kind: 'video', identity: { platform: 'youtube', videoId: 'AbCdEf123_-' }, status: 'failed' }] } }] });
   const sourceMessage = fakeMessage(body, { id: sourceId, timestamp: Math.floor(now / 1000) });

@@ -197,6 +197,17 @@ it.each(['saved-reference', 'terminal-skip', 'storage-failure'] as const)('prote
 it('rejects unsupported durable-state versions before accepting any work', () => {
   const store = createStore(':memory:');
   stores.push(store);
-  expect(() => store.acceptRelaySource({ ...source, version: 2 } as unknown as RelaySource)).toThrow();
+  expect(() => store.acceptRelaySource({ ...source, version: 3 } as unknown as RelaySource)).toThrow();
+  expect(store.listRelaySources()).toEqual([]);
+});
+
+it('rejects a cleanup notice claim without a persisted failure outcome', () => {
+  const store = createStore(':memory:');
+  stores.push(store);
+  const current = { ...source, version: 2 as const, contentHash: 'b'.repeat(64), cleanup: {
+    version: 1 as const, initial: 'link-only' as const, initialFingerprint: 'b'.repeat(64), disqualifications: [],
+    intentRecorded: true, outcome: 'unknown' as const, noticeClaimed: true,
+  } } satisfies RelaySource;
+  expect(() => store.acceptRelaySource(current)).toThrow();
   expect(store.listRelaySources()).toEqual([]);
 });

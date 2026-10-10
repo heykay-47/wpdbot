@@ -1,7 +1,12 @@
-import type { RelaySource } from './relayState.js';
+import type { CleanupDeferral, RelaySource } from './relayState.js';
 import type { Store } from './store.js';
 
 export function sourceUnfinished(source: RelaySource, store: InspectionStore): boolean {
+  return sourceMediaUnfinished(source, store) || (source.version === 2 && (source.cleanup.intentRecorded
+    || (!source.cleanup.disqualifications.length && source.cleanup.deferredReason !== undefined)));
+}
+
+export function sourceMediaUnfinished(source: RelaySource, store: InspectionStore): boolean {
   return source.status !== 'settled' || source.links.some((link) => link.status === 'failed'
     || link.plan?.items.some((_item, itemIndex) => !['confirmed', 'skipped'].includes(itemOutcome(store, source, source.links.indexOf(link), itemIndex))));
 }
@@ -27,7 +32,7 @@ const outcomeText: Record<ItemOutcome, string> = {
 };
 
 export function formatSourceInspection(store: InspectionStore, source: RelaySource): string {
-  const lines = [`Ref ${source.workReference ?? 'unavailable'} — ${source.status}`, 'Original retained.'];
+  const lines = [`Ref ${source.workReference ?? 'unavailable'} — ${source.status}`, cleanupSummary(source)];
   let shown = 0;
   for (const [linkIndex, link] of source.links.entries()) {
     if (shown >= 20) { lines.push('More positions omitted from this bounded view.'); break; }
@@ -45,12 +50,52 @@ export function formatSourceInspection(store: InspectionStore, source: RelaySour
   return lines.join('\n');
 }
 
+function cleanupSummary(source: RelaySource): string {
+  if (source.version === 1) return 'Source retained; legacy sources are never cleanup-eligible.';
+  if (source.cleanup.intentRecorded) {
+    switch (source.cleanup.outcome) {
+      case 'unknown': return 'Cleanup intent recorded; outcome unknown — no further attempt.';
+      case 'not-invoked': return 'Cleanup intent consumed; deletion was not invoked — no further attempt.';
+      case 'threw': return 'Cleanup attempt threw; remote outcome uncertain — no further attempt.';
+      case 'returned-unverified': return 'Cleanup request returned; group-wide removal unverified — no further attempt.';
+      case 'not-attempted': return 'Cleanup intent recorded; outcome unavailable — no further attempt.';
+    }
+  }
+  if (source.cleanup.initial === 'mixed-content') return 'Source retained; mixed-content sources are never cleaned up.';
+  const reason = source.cleanup.disqualifications[0];
+  if (reason) {
+    const text: Record<typeof reason, string> = {
+      'prior-message-duplicate': 'prior-message duplicate skip',
+      'skipped-media': 'skipped or unverifiable media',
+      'document-repost': 'document repost',
+      'source-edited': 'source edit or identity mismatch',
+      'media-plan-changed': 'media plan changed',
+      expired: 'cleanup age expired',
+      'clock-uncertain': 'acceptance time uncertain',
+    };
+    return `Source retained; cleanup ineligible (${text[reason]}).`;
+  }
+  if (source.cleanup.deferredReason) {
+    const text: Record<CleanupDeferral, string> = {
+      'media-unconfirmed': 'inline repost evidence incomplete',
+      'group-disabled': 'group was disabled at the last check',
+      'source-missing': 'source missing at the last lookup',
+      'source-unavailable': 'source lookup unavailable at the last check',
+      'authority-unavailable': 'deletion authority unavailable at the last check',
+      'client-unavailable': 'client unavailable at the last check',
+      'storage-unavailable': 'storage verification failed at the last check',
+    };
+    return `Source retained; cleanup deferred (${text[source.cleanup.deferredReason]}).`;
+  }
+  return 'Source retained; guarded cleanup is pending confirmed inline reposts and fresh safety checks.';
+}
+
 export function formatGroupInspection(store: Store, groupId: string): string {
   const sources = store.listRelaySources().filter((source) => source.groupId === groupId && sourceUnfinished(source, store));
   return [`Unfinished work in this group: ${sources.length} sources`, ...sources.slice(0, 10).map((source) => {
     const failed = source.links.some((link, linkIndex) => link.status === 'failed' || link.plan?.items.some((_item, itemIndex) => itemOutcome(store, source, linkIndex, itemIndex) === 'failed'));
     const unknown = source.links.some((link, linkIndex) => link.plan?.items.some((_item, itemIndex) => itemOutcome(store, source, linkIndex, itemIndex) === 'delivery_unknown'));
-    return `${source.workReference ?? 'Reference unavailable'} — ${source.status}${failed ? '; failed items' : ''}${unknown ? '; delivery unknown — do not retry' : ''}\n  ${source.links.length} links · original retained`;
+    return `${source.workReference ?? 'Reference unavailable'} — ${source.status}${failed ? '; failed items' : ''}${unknown ? '; delivery unknown — do not retry' : ''}\n  ${source.links.length} links · ${cleanupSummary(source)}`;
   }),
   ...(sources.length > 10 ? ['More sources omitted. Reply to a source with !bot inspect for its current status.'] : [])].join('\n\n');
 }

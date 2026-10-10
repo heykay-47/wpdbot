@@ -21,7 +21,7 @@ const messages = {
 export type FailureCause = keyof typeof messages;
 const causes = Object.keys(messages);
 export type ErrorFacts = { exitCode?: number; httpStatus?: number };
-const stages = ['relay', 'settings', 'record', 'download', 'upload', 'duplicate-check', 'recovery', 'whatsapp-message', 'whatsapp-runtime', 'startup', 'permission', 'inspect', 'auth', 'notification', 'runtime', 'login'] as const;
+const stages = ['relay', 'settings', 'record', 'download', 'upload', 'duplicate-check', 'recovery', 'cleanup', 'whatsapp-message', 'whatsapp-runtime', 'startup', 'permission', 'inspect', 'auth', 'notification', 'runtime', 'login'] as const;
 
 export class UserFacingError extends Error {
   readonly userFacing = true;

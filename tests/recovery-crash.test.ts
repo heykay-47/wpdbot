@@ -1,5 +1,5 @@
 import { fork } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -133,3 +133,63 @@ it.each(['retry-admitted', 'retry-intent', 'retry-evidence', 'retry-confirmed'] 
     } finally { store.close(); }
   }
 });
+
+it.each(['cleanup-pre-intent', 'cleanup-post-intent', 'cleanup-after-invocation'] as const)(
+  'preserves guarded cleanup allowance after SIGKILL at %s across two recovery reopens', async (stage) => {
+    const root = mkdtempSync(join(tmpdir(), 'wpdbot-cleanup-crash-'));
+    roots.push(root);
+    const path = join(root, 'bot.sqlite');
+    const marker = join(root, 'external-deletions.txt');
+    const child = fork(new URL('./fixtures/cleanup-worker.ts', import.meta.url), [path, marker, stage], {
+      execArgv: ['--import', 'tsx'], stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    let stderr = '';
+    child.stderr?.on('data', (chunk) => { stderr += String(chunk); });
+    const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`Cleanup worker did not reach checkpoint: ${stderr}`)), 10_000);
+        child.once('message', () => { clearTimeout(timer); resolve(); });
+        child.once('error', (error) => { clearTimeout(timer); reject(error); });
+        child.once('exit', () => { clearTimeout(timer); reject(new Error(`Cleanup worker exited before checkpoint: ${stderr}`)); });
+      });
+    } finally {
+      child.kill('SIGKILL');
+      await exited;
+    }
+
+    const deleteSourceForCleanup = vi.fn(async (_source: unknown, canInvoke: () => boolean) => {
+      if (!canInvoke()) return 'blocked' as const;
+      appendFileSync(marker, 'deleted\n');
+      return 'returned' as const;
+    });
+    let durableOutcome: string | undefined;
+    for (let reopen = 0; reopen < 2; reopen++) {
+      const store = createStore(path);
+      try {
+        const sendVideoOnce = vi.fn();
+        await recoverRelaySources({ store, timezone: 'UTC', nowMs: 3_000,
+          downloader: { download: vi.fn(), resolveYouTube: vi.fn(), resolveInstagram: vi.fn() },
+          whatsapp: {
+            sendVideo: vi.fn(), sendVideoOnce, sendText: vi.fn(async () => undefined), deleteMessage: vi.fn(),
+            checkSourceForCleanup: vi.fn(async () => 'ready' as const), deleteSourceForCleanup,
+            getSourceMessage: vi.fn(async () => null), lookupRepost: vi.fn(async () => null),
+          },
+        });
+        expect(sendVideoOnce).not.toHaveBeenCalled();
+        const saved = store.getRelaySource('group@g.us', 'source-1')!;
+        expect(saved.version).toBe(2);
+        if (saved.version === 2) {
+          expect(saved.cleanup.intentRecorded).toBe(true);
+          durableOutcome ??= saved.cleanup.outcome;
+          expect(saved.cleanup.outcome).toBe(durableOutcome);
+        }
+      } finally { store.close(); }
+    }
+
+    const externalCalls = existsSync(marker) ? readFileSync(marker, 'utf8').trim().split('\n').length : 0;
+    expect(externalCalls).toBe(stage === 'cleanup-pre-intent' || stage === 'cleanup-after-invocation' ? 1 : 0);
+    expect(deleteSourceForCleanup).toHaveBeenCalledTimes(stage === 'cleanup-pre-intent' ? 1 : 0);
+    expect(durableOutcome).toBe(stage === 'cleanup-pre-intent' ? 'returned-unverified' : 'unknown');
+  },
+);

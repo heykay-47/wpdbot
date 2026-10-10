@@ -7,7 +7,7 @@ WhatsApp group media relay bot for personal use. It watches enabled WhatsApp gro
 - Relays Instagram reels/posts and YouTube Shorts in WhatsApp groups.
 - Uses `whatsapp-web.js` with QR login and persisted WhatsApp Web session data.
 - Downloads identified videos with `yt-dlp`, using `ffmpeg` where stream merging requires it.
-- Retains source messages for both platforms until the remaining cleanup safeguards are implemented.
+- Retains sources by default and applies one guarded cleanup attempt only to newly accepted, fully confirmed link-only sources.
 - Suppresses equivalent-video reposts per group, with durable protection for unresolved sends.
 - Tracks ordered multi-link work durably and resumes eligible interrupted work after restart.
 - Supports authorized per-group enable/disable/status/inspect/settings commands and source-targeted safe retry.
@@ -22,7 +22,14 @@ WhatsApp group media relay bot for personal use. It watches enabled WhatsApp gro
 - A group's duplicate window starts when a repost's confirmation is observed, not when its source was posted or queued. Duplicate skips do not extend it. A new source message may request another repost after expiry. Confirmed outcomes for the same source message remain completed even after expiry or restart. Queued work rechecks current settings and time.
 - Both platforms prepare media before making one submission attempt. There are no transcode or document retries after submission begins. Confirmation requires a sent-message ID and an observed server-or-stronger acknowledgement in the originating group. A send waits at most 30 seconds for that evidence. Timeout does not cancel the external effect or prove failure. It does not prove every participant received the repost.
 - Identity-based send reservations are stored before submission. An unresolved send blocks that video across source messages and restarts, regardless of duplicate-window expiry. A definite inspection/download failure does not create a confirmed duplicate marker. A submitted video whose confirmation cannot be recorded remains held rather than being sent again.
-- All source messages remain intact, including document reposts, duplicate-only and mixed new/duplicate requests. Exact-ID reconciliation is supported; authorized recovery commands and guarded source cleanup remain later work. Do not erase progress records to force another send.
+- Sources with document reposts, duplicate-only or mixed new/duplicate requests remain intact. Exact-ID reconciliation is supported; do not erase progress records to force another send.
+
+### Guarded source cleanup
+
+- Only a newly accepted source whose content consists solely of its supported links can qualify. Legacy source records are permanently ineligible; migration never reconstructs cleanup evidence. Mixed-content messages, duplicate skips, skipped or unverifiable media, document delivery, changed media plans, and positively observed source edits stay intact.
+- Cleanup waits until every required video has a durable confirmed repost with its known message ID, inline-video delivery mode, and server-or-stronger acknowledgement in the originating group. Failed, held, or unresolved work keeps the source. Temporary lookup, group-enable, client, or authority blockers defer cleanup without recording an intent.
+- The bot rechecks the source identity and current group/admin authority before its sole cleanup attempt, no later than 24 hours after durable acceptance. A durable deletion intent is recorded first and consumes that allowance even if a final check fails, the process stops, deletion throws, or its outcome cannot be saved. A later recovery event may reevaluate only work that has not recorded intent; there is no polling loop or cleanup command.
+- A fulfilled WhatsApp delete request is recorded as returned but does not prove the source disappeared for every participant. Inspection reports the durable cleanup state and safe last-observed reasons for temporary deferral, not permanent ineligibility. Deferral reasons are saved when storage permits; no diagnostic write is assumed after a storage failure. A bounded group notice is sent at most once for post-intent failure or uncertainty. Successful requests are silent. Keep the database private because it contains source links and operational evidence.
 
 SQLite initialization adds `media_relay_attempts` without rewriting existing settings, history, URL hashes, or `instagram_relay_items`. Legacy URL markers still suppress only their exact legacy-normalized URL in the same group/window; they are not promoted to ACK-confirmed identities or broadened to aliases. Old Instagram confirmations still protect the same source message, and old unresolved items protect the same resolved video across messages. Old records have no reliable confirmation timestamp, so no canonical windows are backfilled. A newly encountered URL alias can therefore be reposted despite an old URL-only marker.
 
@@ -44,7 +51,7 @@ A zero-hour stored group window disables prior-message confirmed suppression, no
 - A post with several videos reposts each verifiable video in post order. Photos and entries without reliable video metadata are not reposted.
 - A source link with `img_index=3` requests only the third media item, counting photos as positions too. An invalid, unavailable, or non-video selection does not fall back to another video.
 - A failed item download or media preparation does not prevent other verifiable videos from being processed. Each video must meet the effective media budget; configured duration limits also apply to the probed final file.
-- Instagram source messages are always retained, including fully reposted single-video posts. Safe automatic cleanup awaits the remaining restart-recovery and deletion-guard work.
+- Instagram source messages containing photos, unverifiable entries, or other skipped media remain intact. A fully confirmed link-only video source may qualify under the guarded cleanup rules above; multi-item collections with skipped content do not.
 - Unresolved sends stop that collection, not unrelated later links. Exact stored repost IDs may be reconciled. A targeted retry never includes an unresolved send; other definitely pre-send failures may be reviewed when their source and saved plan still match. Do not erase progress records to force a retry; review the group first because the video may already be present.
 
 Metadata handling is conservative when yt-dlp omits entries or cannot establish their positions. Its deployed version is not pinned by this project, so fixture-based checks do not replace a separately authorized private-group smoke test.
@@ -171,7 +178,7 @@ Only group admins or the configured bot owner can manage the bot.
 
 Settings and retry commands are available while a group is disabled; retry itself is rejected until enabled. A retry preview is bound to the requesting admin, group, exact source, settings revision and eligible work; repeated requests do not extend its five-minute lifetime. Source age is the only retry bypass. Restart, disable, changed settings, or lost authority revokes unused retry permission. A confirmation for a delivery-unknown item never opens a retry path.
 
-Every durably accepted source has a persistent random `W-…` reference. Equivalent links in different sources have different references; references grant no access. A settled source may still have failed items. Inspection uses saved outcomes and exact stored attempt evidence, not guessed historical causes/counts/times. Unsupported saved records remain untouched and held, without blocking unrelated supported recovery. Automatic source cleanup remains unimplemented.
+Every durably accepted source has a persistent random `W-…` reference. Equivalent links in different sources have different references; references grant no access. A settled source may still have failed items. Inspection uses saved outcomes and exact stored attempt evidence, not guessed historical causes/counts/times. Unsupported saved records remain untouched and held, without blocking unrelated supported recovery. Source inspection reports cleanup eligibility or the one recorded cleanup outcome without claiming group-wide removal.
 
 ### Private diagnostics and login
 
@@ -393,8 +400,8 @@ Preserve database and LocalAuth data. Diagnose privately, then use the stopped-s
 - Send `!bot status` and confirm bot admin shows `yes`.
 - Send `!bot enable` and confirm enabled response.
 - Send one YouTube Shorts link, one Instagram reel link, and one Instagram post link.
-- Confirm reposts, captions, equivalent-link duplicate skips, and source retention for both platforms. Automatic source cleanup is disabled in the incoming relay.
-- Test an Instagram collection containing several videos and a photo, then a link selecting a video with `img_index`. Verify video order, photo omission, selected-item attribution, and source retention.
+- Confirm reposts, captions, equivalent-link duplicate skips, and the guarded cleanup behavior. A newly accepted link-only source may be removed automatically after every required inline-video repost is confirmed; do not use content that must remain visible.
+- Test an Instagram collection containing several videos and a photo, then a link selecting a video with `img_index`. Verify video order, photo omission, selected-item attribution, and that sources with skipped photo content remain intact.
 - Send an unsupported link and confirm the bot ignores it.
 - Send `!bot disable` and confirm future links are ignored.
 

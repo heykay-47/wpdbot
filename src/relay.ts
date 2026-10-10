@@ -4,13 +4,14 @@ import { basename, dirname, relative, resolve } from 'node:path';
 import { formatCaption } from './caption.js';
 import type { Downloader } from './downloader.js';
 import { downloadCause, errorFacts, messageForError, userError, UserFacingError, type ErrorReportContext } from './errorReporter.js';
-import { formatSourceInspection, sourceUnfinished } from './inspection.js';
+import { formatSourceInspection, sourceMediaUnfinished } from './inspection.js';
 import type { KeyedTaskQueue } from './keyedTaskQueue.js';
 import { extractSupportedUrls, normalizeUrlForDuplicate } from './extractors.js';
 import { candidateMediaIdentity, mediaIdentityKey, type MediaIdentity } from './mediaIdentity.js';
 import type { MediaRepostKey, RepostConfirmation, RepostEvidence, RetryPassTarget, Store } from './store.js';
-import { UnsupportedRelayStateError, type RelayItem, type RelayLink, type RelayPlan, type RelaySource } from './relayState.js';
+import { addCleanupDisqualification, UnsupportedRelayStateError, type CleanupDisqualification, type RelayItem, type RelayLink, type RelayPlan, type RelaySource } from './relayState.js';
 import type { RelayLifecycle } from './relayLifecycle.js';
+import { attemptGuardedSourceCleanup, isLinkOnlySource, type CleanupCheckResult, type CleanupDeleteResult, type CleanupSourceIdentity } from './sourceCleanup.js';
 
 export type IncomingMessage = {
   id: string;
@@ -28,6 +29,8 @@ export type RelayWhatsapp = {
   sendVideoOnce(groupId: string, filePath: string, caption: string, deliveryMode?: 'document', observe?: (evidence: RepostEvidence) => void): Promise<RepostConfirmation>;
   sendText(groupId: string, text: string): Promise<void>;
   deleteMessage(groupId: string, messageId: string): Promise<void>;
+  checkSourceForCleanup?(source: CleanupSourceIdentity): Promise<CleanupCheckResult>;
+  deleteSourceForCleanup?(source: CleanupSourceIdentity, canInvoke: () => boolean): Promise<CleanupDeleteResult>;
 };
 
 export type RelayDownloader = {
@@ -40,7 +43,8 @@ export type HandleIncomingMessageInput = {
   message: IncomingMessage;
   store: Pick<Store, 'getGroupSettings' | 'wasRecentlyPosted' | 'getMediaDisposition' | 'beginMediaRepost' | 'confirmMediaRepost'
     | 'acceptRelaySource' | 'getRelaySource' | 'saveRelaySource' | 'listRelaySources' | 'getMediaAttempt' | 'recordMediaEvidence'
-    | 'isRetryPassActive' | 'hasActiveRetryPass' | 'revokeRetryPass' | 'completeRetryPass'>;
+    | 'isRetryPassActive' | 'hasActiveRetryPass' | 'revokeRetryPass' | 'completeRetryPass'
+    | 'beginRelaySourceCleanup' | 'recordRelaySourceCleanupOutcome'>;
   whatsapp: RelayWhatsapp;
   downloader: RelayDownloader;
   timezone: string;
@@ -125,10 +129,12 @@ async function handleIncomingMessageCore(input: HandleIncomingMessageInput, erro
 
   if (!message.id.trim()) throw userError(`${links[0].platform === 'youtube' ? 'YouTube' : 'Instagram'} relay needs a source message ID. Original message kept.`);
   errorContext.step = 'record';
+  const contentHash = relayContentHash(message.body);
   store.acceptRelaySource({
-    version: 1, groupId: message.groupId, messageId: message.id, senderId: message.senderId,
+    version: 2, groupId: message.groupId, messageId: message.id, senderId: message.senderId,
     senderName: message.senderName, timestampMs: message.timestampMs, acceptedAtMs: processingNow(input),
-    contentHash: relayContentHash(message.body), status: 'ready', cleanup: 'retained',
+    contentHash, status: 'ready', cleanup: { version: 1, initial: isLinkOnlySource(message.body, links) ? 'link-only' : 'mixed-content',
+      initialFingerprint: contentHash, disqualifications: [], intentRecorded: false, outcome: 'not-attempted', noticeClaimed: false },
     links: links.map((link) => ({ url: link.url, platform: link.platform, urlHash: hashUrl(normalizeUrlForDuplicate(link.url)), status: 'ready', plan: null })),
   });
 
@@ -137,9 +143,12 @@ async function handleIncomingMessageCore(input: HandleIncomingMessageInput, erro
     const source = store.getRelaySource(message.groupId, message.id)!;
     errorContext.reference = source.workReference;
     if (store.hasActiveRetryPass(message.groupId, message.id)) return;
-    if (source.status === 'settled' || source.status === 'held') return;
     if (source.contentHash !== relayContentHash(message.body) || source.senderId !== message.senderId) {
       holdSource(input, source, 'source-changed');
+      return;
+    }
+    if (source.status === 'settled' || source.status === 'held') {
+      await maybeCleanupSource(input, source);
       return;
     }
     if (!checkpoint(input, source)) return;
@@ -158,6 +167,7 @@ async function handleIncomingMessageCore(input: HandleIncomingMessageInput, erro
       if (!link.plan && currentSettings.duplicateWindowHours > 0
         && store.wasRecentlyPosted(message.groupId, link.urlHash, processingNow(input), currentSettings.duplicateWindowHours)) {
         link.status = 'skipped';
+        disqualifySourceCleanup(store, source, 'prior-message-duplicate');
         store.saveRelaySource(source);
         continue;
       }
@@ -173,9 +183,11 @@ async function handleIncomingMessageCore(input: HandleIncomingMessageInput, erro
     if (source.status === 'ready' && !source.links.some((link) => link.status === 'ready'
       && (!link.plan || link.plan.items.some((item) => item.status === 'ready' || item.status === 'held')))) source.status = 'settled';
     if (!input.control || input.control.canPersist()) store.saveRelaySource(source);
-    if (source.links.length > 1 && sourceUnfinished(source, store) && JSON.stringify(source.links) !== previousOutcomes
-      && (!input.control || input.control.canSubmit())) {
-      await input.whatsapp.sendText(message.groupId, `Relay update · source incomplete; original kept.\n${formatSourceInspection(store, source)}`)
+    await maybeCleanupSource(input, source);
+    if (input.control && !input.control.canSubmit()) return;
+    const latest = store.getRelaySource(message.groupId, message.id);
+    if (latest && latest.links.length > 1 && sourceMediaUnfinished(latest, store) && JSON.stringify(latest.links) !== previousOutcomes) {
+      await input.whatsapp.sendText(message.groupId, `Relay update · source incomplete; original kept.\n${formatSourceInspection(store, latest)}`)
         .catch((error: unknown) => { messageForError(error, { ...errorContext, step: 'notification' }); });
     }
   };
@@ -226,6 +238,7 @@ export async function recoverRelaySources(input: RecoveryInput): Promise<void> {
         releaseResolvedRetryHold(input.store, source);
         input.store.saveRelaySource(source);
       }
+      await maybeCleanupSource(input, source);
       if (source.status === 'settled' || source.status === 'held') return;
       if (input.store.hasActiveRetryPass(source.groupId, source.messageId)) return;
       if (!checkpoint(input, source)) return;
@@ -233,6 +246,7 @@ export async function recoverRelaySources(input: RecoveryInput): Promise<void> {
       if (input.control && !input.control.canPersist()) return;
       if (!message || !message.isGroup || message.fromMe || message.groupId !== source.groupId || message.id !== source.messageId
          || message.senderId !== source.senderId || relayContentHash(message.body) !== source.contentHash) {
+        if (message) disqualifySourceCleanup(input.store, source, 'source-edited');
         holdSource(input, source, 'source-unavailable-or-changed');
         return;
       }
@@ -291,6 +305,7 @@ export async function executeTargetedRetry(
       && (!link.plan || link.plan.items.some((item) => item.status === 'ready' || item.status === 'held')))) source.status = 'settled';
     if (!executionInput.control || executionInput.control.canPersist()) executionInput.store.saveRelaySource(source);
     executionInput.store.completeRetryPass(executionInput.retry.passId);
+    await maybeCleanupSource(executionInput, source);
   } catch (error) {
     executionInput.store.revokeRetryPass(executionInput.retry.passId);
     if (!(error instanceof UserFacingError) && !(error instanceof UnsupportedRelayStateError)) executionInput.control?.failStorage();
@@ -331,6 +346,7 @@ async function relayYouTube(input: ActiveInput, url: string, urlHash: string, er
       const plan: RelayPlan = { parentId: candidate.videoId, totalItems: 1, items: [{ index: 1, kind: 'video', identity: candidate, status: progress === 'completed' ? 'confirmed' : progress === 'duplicate' ? 'skipped' : 'held' }] };
       if (!input.link.plan) input.link.plan = plan;
       else input.link.plan.items[0].status = plan.items[0].status;
+      if (progress === 'duplicate') disqualifySourceCleanup(store, input.source, 'prior-message-duplicate');
       store.saveRelaySource(input.source);
       if (progress === 'held' && !alreadyHeld) throw unresolvedSendError('youtube');
       return;
@@ -352,6 +368,7 @@ async function relayYouTube(input: ActiveInput, url: string, urlHash: string, er
   const progress = store.getMediaDisposition(key, processingNow(input), store.getGroupSettings(message.groupId).duplicateWindowHours);
   if (progress !== 'ready') {
     item.status = progress === 'completed' ? 'confirmed' : progress === 'duplicate' ? 'skipped' : 'held';
+    if (progress === 'duplicate') disqualifySourceCleanup(store, input.source, 'prior-message-duplicate');
     store.saveRelaySource(input.source);
     if (progress === 'held') throw unresolvedSendError('youtube');
     return;
@@ -404,6 +421,7 @@ async function relayInstagram(input: ActiveInput, url: string, urlHash: string, 
     if (progress !== 'ready') {
       const alreadyHeld = savedItem.status === 'held';
       savedItem.status = progress === 'completed' ? 'confirmed' : progress === 'duplicate' ? 'skipped' : 'held';
+      if (progress === 'duplicate') disqualifySourceCleanup(store, input.source, 'prior-message-duplicate');
       store.saveRelaySource(input.source);
       if (progress === 'held') {
         if (!alreadyHeld) throw unresolvedSendError('instagram');
@@ -446,6 +464,7 @@ function savePlan(input: ActiveInput, plan: RelayPlan): void {
     throw userError('Source media changed. Remaining work held. Original message kept.', 'source_changed');
   }
   input.link.plan ??= plan;
+  if (plan.items.some((item) => item.kind !== 'video')) disqualifySourceCleanup(input.store, input.source, 'skipped-media');
   input.store.saveRelaySource(input.source);
 }
 
@@ -473,13 +492,18 @@ async function submitMedia(input: ActiveInput, submission: MediaSubmission, erro
       throw userError('Video no longer meets the current media size limit. Original message kept.', 'size_limit');
     }
     if (!await retryGuard(input, errorContext)) return;
+    const deliveryMode = download.deliveryMode === 'document' ? 'document' : 'video';
+    if (deliveryMode === 'document') {
+      disqualifySourceCleanup(store, input.source, 'document-repost');
+    }
     errorContext.step = 'record';
     const record = { groupId: message.groupId, senderId: message.senderId, url, urlHash, createdAtMs: processingNow(input) };
     const reservation = store.beginMediaRepost(key, record, store.getGroupSettings(message.groupId).duplicateWindowHours,
-      input.retry ? { retryPassId: input.retry.passId, settingsRevision: input.retry.settingsRevision } : undefined);
+      input.retry ? { retryPassId: input.retry.passId, settingsRevision: input.retry.settingsRevision } : undefined, deliveryMode);
     if (reservation !== 'started') {
       if (input.retry && !store.isRetryPassActive(input.retry.passId)) return;
       submission.item.status = reservation === 'completed' ? 'confirmed' : reservation === 'duplicate' ? 'skipped' : 'held';
+      if (reservation === 'duplicate') disqualifySourceCleanup(store, input.source, 'prior-message-duplicate');
       store.saveRelaySource(input.source);
       if (reservation === 'held') throw unresolvedSendError(key.identity.platform);
       return;
@@ -503,7 +527,7 @@ async function submitMedia(input: ActiveInput, submission: MediaSubmission, erro
       }
     };
     const sending = whatsapp.sendVideoOnce(message.groupId, download.filePath, caption,
-      download.deliveryMode === 'document' ? 'document' : undefined, observe);
+      deliveryMode === 'document' ? 'document' : undefined, observe);
     const confirmation = await (input.control ? input.control.track(sending) : sending).catch((error: unknown) => {
       if (input.control && !input.control.canPersist()) return null;
       persistSubmittedItemStatus(input, submission.item, 'held');
@@ -558,10 +582,37 @@ function releaseResolvedRetryHold(store: HandleIncomingMessageInput['store'], so
 
 function holdSource(input: Pick<HandleIncomingMessageInput, 'store' | 'logger'>, source: RelaySource, reason: 'source-changed' | 'media-changed' | 'source-unavailable-or-changed' | 'stale'): void {
   const changed = source.status !== 'held' || source.holdReason !== reason;
+  if (reason === 'source-changed') disqualifySourceCleanup(input.store, source, 'source-edited');
+  if (reason === 'media-changed') disqualifySourceCleanup(input.store, source, 'media-plan-changed');
   source.status = 'held'; source.holdReason = reason;
   input.store.saveRelaySource(source);
   if (changed) messageForError(userError('Work held', reason === 'stale' ? 'age_held' : reason === 'source-unavailable-or-changed' ? 'source_unavailable' : 'source_changed'),
     { step: 'recovery', reference: source.workReference, logger: input.logger });
+}
+
+function disqualifySourceCleanup(store: Pick<Store, 'saveRelaySource'>, source: RelaySource, reason: CleanupDisqualification): void {
+  if (addCleanupDisqualification(source, reason)) store.saveRelaySource(source);
+}
+
+async function maybeCleanupSource(input: Omit<HandleIncomingMessageInput, 'message'>, source: RelaySource): Promise<void> {
+  const checkSourceForCleanup = input.whatsapp.checkSourceForCleanup;
+  const deleteSourceForCleanup = input.whatsapp.deleteSourceForCleanup;
+  if (!checkSourceForCleanup || !deleteSourceForCleanup) return;
+  await attemptGuardedSourceCleanup({
+    store: input.store,
+    source,
+    whatsapp: {
+      checkSourceForCleanup: (target) => checkSourceForCleanup.call(input.whatsapp, target),
+      deleteSourceForCleanup: (target, canInvoke) => deleteSourceForCleanup.call(input.whatsapp, target, canInvoke),
+      sendText: (groupId, text) => input.whatsapp.sendText(groupId, text),
+    },
+    now: () => processingNow(input),
+    canSubmit: () => input.control?.canSubmit() ?? true,
+    canPersist: () => input.control?.canPersist() ?? true,
+    failStorage: () => input.control?.failStorage(),
+    track: input.control ? (operation) => input.control!.track(operation) : undefined,
+    logger: input.logger,
+  });
 }
 
 function checkpoint(input: Pick<HandleIncomingMessageInput, 'control' | 'store' | 'now' | 'nowMs' | 'logger' | 'retry'>, source: RelaySource): boolean {
