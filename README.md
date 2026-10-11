@@ -379,6 +379,20 @@ This check launches and shuts down the real WhatsApp client browser with a tempo
 
 Recovery tests include disposable SQLite databases, synthetic metadata/media, mocked WhatsApp, actual child-process kills at intake/plan/send-intent/evidence/confirmation boundaries, and real SIGINT/SIGTERM handling with a mocked client. These checks do not prove live WhatsApp history availability, recipient playback or delivery.
 
+### Offline Docker qualification
+
+With Docker Compose 2.24.4 or newer and host GnuPG available, run:
+
+```sh
+npm run test:docker
+```
+
+This builds the real Dockerfile (including the complete unit suite and TypeScript build), then rehearses private operations under a randomly named Compose project with disposable named volumes. Image builds may download public dependencies; all rehearsal containers have networking disabled and use synthetic SQLite/auth/cookie fixtures. The normal `.env`, deployment project, and real account volumes are not used. Only the rehearsal's containers, volumes, temporary files and image are removed afterward.
+
+The check exercises passive healthy/unhealthy transitions with process liveness intact, absent and read-only cookie mounts, graceful stopping, GnuPG-encrypted paired SQLite/LocalAuth backup, root-helper restore with preserved UID/file modes, and all saved rows and ambiguity/cleanup guards through two reopens. It uses a synthetic service with the production health server and store, not a logged-in WhatsApp client. Its health intervals are shortened for testing; the normal 30-second drain/35-second Compose grace and passive restart policy remain unchanged. A passing rehearsal is not live extraction, login, delivery, playback, deletion, or deployment qualification.
+
+The synthetic service stops without active sends; the production drain behavior is covered separately by the unit/process-boundary suite. Retry-confirmation replay markers and completed/revoked retry passes are included in the paired snapshot. If Docker resource cleanup fails, the command fails and retains its synthetic configuration for diagnosis rather than claiming successful cleanup.
+
 ## Troubleshooting
 
 ### Native SQLite crashes on Node 24.19
@@ -393,7 +407,7 @@ npm_config_build_from_source=true npm rebuild better-sqlite3
 npm test
 ```
 
-If npm gates install scripts, use its scoped `--allow-scripts=better-sqlite3` option for that rebuild. Do not enable unrelated install scripts. No SQLite database deletion or dependency-version upgrade is required. The rebuilt addon also runs on Node 24.19.0. Until the upstream fix lands, this caveat also applies to native dependencies compiled by the floating `node:24-slim` Docker base; use unaffected build headers when rebuilding an image.
+If npm gates install scripts, use its scoped `--allow-scripts=better-sqlite3` option for that rebuild. Do not enable unrelated install scripts. No SQLite database deletion or dependency-version upgrade is required. The rebuilt addon also runs on Node 24.19.0. The Docker build uses Node 24.18.0 target headers for native dependencies, then copies the tested, production-only dependencies to runtime without downgrading the floating `node:24-slim` runtime. Keep this workaround until the upstream cleanup-hook issue is fixed and a fresh Docker qualification passes.
 
 ### GitHub SSH Pull Fails On A Server
 

@@ -4,15 +4,22 @@ ENV PUPPETEER_SKIP_DOWNLOAD=true
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 make g++ ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY package.json package-lock.json ./
-RUN npm ci
+# Avoid the Node 24.19+ native cleanup-hook regression with unaffected build headers.
+RUN npm_config_build_from_source=true npm_package_config_node_gyp_target=24.18.0 npm ci
 
 COPY tsconfig.json vitest.config.ts ./
 COPY src ./src
 COPY tests ./tests
+COPY README.md docker-compose.yml .env.example ./
 
-RUN npm test
+RUN mkdir -p /tmp/opencode && npm test
 RUN npm run build
+RUN npm prune --omit=dev
 
 FROM node:24-slim AS runtime
 
@@ -59,7 +66,7 @@ RUN groupadd --system --gid 10001 wpdbot \
     && chown -R wpdbot:wpdbot /app /data /tmp/wpdbot-downloads
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+COPY --from=build /app/node_modules ./node_modules
 
 COPY --from=build /app/dist ./dist
 

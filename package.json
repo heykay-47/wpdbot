@@ -12,6 +12,7 @@
     "start": "node dist/entrypoint.js",
     "test": "vitest run",
     "test:browser": "npm run build && node --test tests/whatsapp-browser.test.mjs",
+    "test:docker": "node --test tests/docker-operations.test.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {
